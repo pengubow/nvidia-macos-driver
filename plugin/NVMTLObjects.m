@@ -14,7 +14,10 @@ void nvlog(const char *fmt, ...);
 #import <objc/runtime.h>
 #import <objc/message.h>
 static int nvmtl_trace_on(void);
-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void nvtrace_emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// Guard the call site: converting NSString arguments on every draw is expensive
+// even when the trace writer immediately returns without emitting anything.
+#define nvtrace(...) do { if (nvmtl_trace_on()) nvtrace_emit(__VA_ARGS__); } while (0)
 static unsigned long long nvmtl_global_trace_id(id o) {
     static char key; static unsigned long long next = 1;
     @synchronized (o) {
@@ -167,16 +170,21 @@ static inline void nvmtl_resref(id o, int d) {
 // for-in runs only over a command buffer part's own copy (one thread), never over a set still being encoded into
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)st objects:(id __unsafe_unretained [])b count:(NSUInteger)n {
     return [_s countByEnumeratingWithState:st objects:b count:n]; }
-- (void)addObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); BOOL had = [_s member:o] != nil; if (!had) [_s addObject:o];
+// _mru: the object added last, which is in the set until it is removed. Encoders add the same buffer for draw after
+// draw (Apple's GL: the same index and vertex buffers), and that repeat skips the set's hash lookup.
+- (void)addObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk);
+    if (_mru == (__bridge const void *)o) { os_unfair_lock_unlock(&_lk); return; }
+    BOOL had = [_s member:o] != nil; if (!had) [_s addObject:o]; _mru = (__bridge const void *)o;
     os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
 - (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); BOOL had = [_s member:o] != nil; if (had) [_s removeObject:o];
+    if (_mru == (__bridge const void *)o) _mru = NULL;
     os_unfair_lock_unlock(&_lk); if (had) nvmtl_resref(o, -1); }
 // Clearing, copying and sealing never go through -allObjects. That array is autoreleased into the CALLER's pool, and
 // these run on the app's own commit thread: Geekbench 7 never drains that pool, so every resource a command buffer had
 // ever touched stayed alive, and Super Resolution filled VRAM with 9 MB MPS buffers until allocations were refused.
 // The sets below are owned (+1) and released at the end of scope.
 - (void)removeAllObjects { NSMutableSet *fresh = [NSMutableSet new], *old;
-    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; _mru = NULL; os_unfair_lock_unlock(&_lk);
     for (id o in old) nvmtl_resref(o, -1); }
 - (id)copyWithZone:(NSZone *)z { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *c = [NVMTLResSet new];
@@ -191,7 +199,7 @@ static inline void nvmtl_resref(id o, int d) {
 // new owner, so each resource's residency count is unchanged; the new set's -dealloc gives it back.
 - (NVMTLResSet *)nvmtlTakeAll { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *taken = [NVMTLResSet new]; NSMutableSet *empty = taken->_s;
-    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; _mru = NULL; os_unfair_lock_unlock(&_lk);
     return taken; }
 - (void)dealloc { for (id o in _s) nvmtl_resref(o, -1); }
 @end
@@ -951,6 +959,9 @@ static void nvmtl_storage_twins_out(NVMTLCommandBuffer *cb) {
 static int g_trace_lines;
 static int g_trace_bigonly, g_trace_mute;
 static int nvmtl_trace_on(void) {
+#if NVMTL_RELEASE
+    return 0;   // the request files are refused in release builds (nvmtl_rel_access), so tracing never turns on
+#endif
     static uint64_t next; static int on;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     static int cap = 2500;
@@ -961,8 +972,7 @@ static int nvmtl_trace_on(void) {
 }
 static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_trace_mute = 0; (void)nvmtl_trace_on();
     g_trace_mute = g_trace_bigonly && (w < 1000 || h < 100); return was; }
-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void nvtrace(const char *fmt, ...) {
+static void nvtrace_emit(const char *fmt, ...) {
     if (!nvmtl_trace_on()) return;
     char p[96]; snprintf(p, sizeof p, "/tmp/nvmtl-trace-%d.txt", (int)getpid());
     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -1384,8 +1394,21 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (rc) nvlog("replaceRegion:slice: upload FAILED");
     else [self nvmtlSurfaceOut];
 }
+// A view of a texture buffer is another texel-buffer view of the same bytes. Apple's GL asks for one whenever a buffer
+// texture is sampled through a sampler of another type (Minecraft 26's R8Sint/R32Float buffer textures), every draw
+// until it gets one.
+static NVMTLTexture *nvmtl_texbuf_view(NVMTLTexture *t, MTLPixelFormat f) {
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t vkf = 0, bpp = 0; int a8 = 0;
+    if (!t->_backBuf || nvmtl_pixfmt_public(f, &vkf, &bpp, &a8) || a8 || !bpp || !t->_backBPR || t->_backBPR % bpp) {
+        nvlog("newTextureView: texture-buffer view as format %lu is not carried -> nil", (unsigned long)f); return nil; }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:f width:t->_backBPR / bpp
+                                                                            resourceOptions:[t->_backBuf resourceOptions] usage:t->_usage];
+    return nvmtl_texbuf_make(t->_backBuf, d, t->_backOff);
+}
 - (id<MTLTexture>)nvmtlViewWithFormat:(MTLPixelFormat)f levels:(NSRange)levels {
     if (!levels.length || levels.location >= self.mipmapLevelCount || levels.length > self.mipmapLevelCount - levels.location) return nil;
+    if ([self nvi]->mtl_type == 9) return nvmtl_texbuf_view(self, f);
     NVMTLTexture *v = [NVMTLTexture new];
     { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_usage = [self usage];
     v->_q = _q; v->_fmt = f; v->_surf = _surf; v->_plane = _plane;
@@ -1431,6 +1454,8 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
         !slices.length || slices.location >= availableSlices || slices.length > availableSlices - slices.location) return nil;
     if (tt == MTLTextureType2D && !slices.location && slices.length <= 1 && [self nvi]->mtl_type == 2) return [self nvmtlViewWithFormat:f levels:levels];
     if (tt == MTLTextureType2DMultisample && !slices.location && slices.length <= 1 && [self nvi]->mtl_type == 4) return [self nvmtlViewWithFormat:f levels:levels];
+    if (tt == MTLTextureTypeTextureBuffer || [self nvi]->mtl_type == 9)
+        return tt == MTLTextureTypeTextureBuffer && [self nvi]->mtl_type == 9 ? nvmtl_texbuf_view(self, f) : nil;
     if (tt == MTLTextureType3D && [self nvi]->mtl_type == 7 && !slices.location) slices = NSMakeRange(0, 1);
     if (((tt == MTLTextureType1D || tt == MTLTextureType1DArray) && [self nvi]->mtl_type != (uint32_t)tt) || (tt == MTLTextureType2DMultisample && ([self nvi]->mtl_type != 4 && [self nvi]->mtl_type != 8)) || (tt == MTLTextureType2DMultisampleArray && [self nvi]->mtl_type != 8) || (([self nvi]->mtl_type == 4 || [self nvi]->mtl_type == 8) && tt != MTLTextureType2DMultisample && tt != MTLTextureType2DMultisampleArray) || (tt == MTLTextureType3D && [self nvi]->mtl_type != 7)) { nvlog("newTextureView: textureType %lu of a %u-typed texture — not carried", (unsigned long)tt, [self nvi]->mtl_type); return nil; }
     NVMTLTexture *v = [NVMTLTexture new];
@@ -1458,8 +1483,12 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)f textureType:(MTLTextureType)tt
                                          levels:(NSRange)levels slices:(NSRange)slices
                                         swizzle:(MTLTextureSwizzleChannels)sw {
+    const BOOL identity = sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha;
+    if (!identity && [self nvi]->mtl_type == 9) {   // a Vulkan texel buffer has no component mapping
+        static int said; if (!said++) nvlog("newTextureView:swizzle: a texture buffer cannot be swizzled -> nil (said once)");
+        return nil; }
     NVMTLTexture *v = (NVMTLTexture *)[self newTextureViewWithPixelFormat:f textureType:tt levels:levels slices:slices];
-    if (!v || (sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha)) return v;
+    if (!v || identity) return v;
     extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
     uint32_t vkf = 0, bpp = 0; int a8 = 0; void *nv = NULL;
     const uint8_t s4[4] = { (uint8_t)sw.red, (uint8_t)sw.green, (uint8_t)sw.blue, (uint8_t)sw.alpha };
@@ -4786,6 +4815,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     nvmtl_vk_cmd_set_blend_color(&_c, defaultBlend);
     nvmtl_vk_cmd_set_line_width(&_c, 1.0f);
     (void)nvmtl_vk_cmd_set_polygon_mode(&_c, 0);
+    nvmtl_vk_cmd_set_provoking_last(&_c, 0);
     (void)nvmtl_vk_cmd_set_depth_clip(&_c, 1);
     e->_visBuf = (NVMTLBuffer *)d.visibilityResultBuffer;
     MTLClearColor cc = d.colorAttachments[0].clearColor;

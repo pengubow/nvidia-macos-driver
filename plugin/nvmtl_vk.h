@@ -77,6 +77,9 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
+                 unsigned restart_off;  /* GL turned primitive restart off (setPrimitiveRestartEnabled:NO) */
+                 uint32_t dyn_out[2];   /* address-table dynamic offset of the set the last snapshot returned, per stage */
+                 void *tab_out[2];      /* the table page buffer that set's descriptor names */
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
@@ -156,6 +159,8 @@ int  nvmtl_vk_cmd_copy_occlusion(nvk_cmdbuf *c, uint32_t first, uint32_t count, 
 int  nvmtl_vk_have_polygon_mode(void);
 int  nvmtl_vk_cmd_set_depth_clip(nvk_cmdbuf *c, int clip);
 int  nvmtl_vk_cmd_set_polygon_mode(nvk_cmdbuf *c, int line);
+int  nvmtl_vk_have_provoking_last(void);
+void nvmtl_vk_cmd_set_provoking_last(nvk_cmdbuf *c, int last);
 void nvmtl_vk_cmd_set_blend_color(nvk_cmdbuf *c, const float rgba[4]);
 void nvmtl_vk_cmd_set_stencil_ref(nvk_cmdbuf *c, uint32_t front, uint32_t back);
 void nvmtl_vk_cmd_set_depth_bias(nvk_cmdbuf *c, float constant, float slope, float clamp);

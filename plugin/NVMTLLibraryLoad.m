@@ -72,7 +72,6 @@ static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capac
         nvlog("translator cache: content read failed; using process-private identity");
     }
 }
-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 typedef int (*nvmtl_sampler_fn)(const char *, const char *, const char *, uint8_t **, size_t *, char *, size_t);
 static nvmtl_sampler_fn xlate_sampler;
 typedef void (*nvmtl_tglen_fn)(const uint32_t *, uint32_t);
