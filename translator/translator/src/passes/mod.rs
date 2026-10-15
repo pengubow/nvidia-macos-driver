@@ -1452,6 +1452,7 @@ pub(crate) use module_cleanup::{
 };
 mod byte_words;
 mod prune;
+mod resource_phi_fold;
 mod resources;
 mod spirv_cfg;
 mod stage_input;
@@ -2789,6 +2790,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+    resource_phi_fold::fold_constant_resource_phis(&mut ctx, entry_idx);
     propagate_sampler_state_aliases(&mut ctx, entry_idx);
 
     lower_ray_queries(&mut ctx, entry_idx)?;
