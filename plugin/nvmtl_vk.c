@@ -2042,7 +2042,8 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
-                 uint32_t lastdyn[2]; void *lasttab[2]; } nvmtl_bindtable;
+                 uint32_t lastdyn[2]; void *lasttab[2];
+                 uint64_t lasttb[2][4]; } nvmtl_bindtable;   /* the texel-buffer mask the last set was written with */
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 64
@@ -2884,11 +2885,18 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p)
 {
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
-    if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3) || p->tbany) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
+    if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3)) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
     const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
     uint32_t hi = p->stex_hi[which];
-    int live = t->last[which] && !t->dirty[which] && t->last_idx[which] < c->nsets
+    // A texture binding holds an image or, for a shader that reads a texel buffer there, a texel buffer (the layout's
+    // descriptors are mutable). The last set can be bound again, or copied from, only by a pipeline that reads the same
+    // bindings as texel buffers. WAS: any texel-buffer pipeline rebuilt its whole set for every draw (Sodium's terrain:
+    // ~60k sets a second).
+    static const uint64_t notb[4] = { 0, 0, 0, 0 };
+    const uint64_t *tb = p->tbany ? p->tbm[which] : notb;
+    const int sametb = !memcmp(t->lasttb[which], tb, sizeof notb);
+    int live = sametb && t->last[which] && !t->dirty[which] && t->last_idx[which] < c->nsets
                && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
     if (live && hi <= t->last_hi[which]) {
         int covered = 1;
@@ -2901,7 +2909,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     // Only buffer slots changed (Apple's GL rebinds its uniform bytes for every draw). A pipeline that reaches every
     // buffer through the address table (no buffer binding in its mask) still has all its descriptors in the last set;
     // what changed is the table. On the same table page that is a new dynamic offset, not a new set.
-    const int was = t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
+    const int was = sametb && t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
                     && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
     if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull)
         && !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3]) {
@@ -2933,9 +2941,10 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         }
         for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
     }
-    VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL);
+    VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, p->tbany ? tb : NULL, from, from ? cm : NULL);
     if (!s) return s;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
+    memcpy(t->lasttb[which], tb, sizeof notb);
     t->lastdyn[which] = c->dyn_out[which]; t->lasttab[which] = c->tab_out[which];
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
