@@ -1321,6 +1321,10 @@ MTLRenderPipelineDescriptor *nvmtl_gl_rewrite_descriptor(MTLRenderPipelineDescri
 void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err {
     if (err) *err = nil;
+    // Work on a copy: some descriptor getters (vertexLinkedFunctions, ...) create their object on first read, and the
+    // caller's descriptor then no longer equals a fresh one. Apple's GL keys its built-in (blit) pipelines by the
+    // descriptor it passed here, so every blit missed and built a new pipeline.
+    d = [d copy];
     d = nvmtl_gl_rewrite_descriptor(d, err); if (!d) return nil;
     if (nvmtl_vk_init()) return nvmtl_fail(err, @"pipeline: Vulkan is not up in this process");
     id<MTLFunction> vfn = d.vertexFunction, ffn = d.fragmentFunction;

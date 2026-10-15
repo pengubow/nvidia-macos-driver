@@ -170,21 +170,22 @@ static inline void nvmtl_resref(id o, int d) {
 // for-in runs only over a command buffer part's own copy (one thread), never over a set still being encoded into
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)st objects:(id __unsafe_unretained [])b count:(NSUInteger)n {
     return [_s countByEnumeratingWithState:st objects:b count:n]; }
-// _mru: the object added last, which is in the set until it is removed. Encoders add the same buffer for draw after
-// draw (Apple's GL: the same index and vertex buffers), and that repeat skips the set's hash lookup.
-- (void)addObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk);
-    if (_mru == (__bridge const void *)o) { os_unfair_lock_unlock(&_lk); return; }
-    BOOL had = [_s member:o] != nil; if (!had) [_s addObject:o]; _mru = (__bridge const void *)o;
+// _mru: objects added lately, each in the set until it is removed (the set retains it, so its address cannot be reused
+// while it is listed). Encoders add the same few buffers, pipelines and samplers draw after draw (Apple's GL rebinds its
+// vertex, index and uniform buffers for every draw), and a hit skips the set's hash lookup.
+- (void)addObject:(id)o { if (!o) return; const void *p = (__bridge const void *)o; os_unfair_lock_lock(&_lk);
+    for (unsigned k = 0; k < 8; k++) if (_mru[k] == p) { os_unfair_lock_unlock(&_lk); return; }
+    BOOL had = [_s member:o] != nil; if (!had) [_s addObject:o]; _mru[_mruNext++ & 7] = p;
     os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
 - (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); BOOL had = [_s member:o] != nil; if (had) [_s removeObject:o];
-    if (_mru == (__bridge const void *)o) _mru = NULL;
+    for (unsigned k = 0; k < 8; k++) if (_mru[k] == (__bridge const void *)o) _mru[k] = NULL;
     os_unfair_lock_unlock(&_lk); if (had) nvmtl_resref(o, -1); }
 // Clearing, copying and sealing never go through -allObjects. That array is autoreleased into the CALLER's pool, and
 // these run on the app's own commit thread: Geekbench 7 never drains that pool, so every resource a command buffer had
 // ever touched stayed alive, and Super Resolution filled VRAM with 9 MB MPS buffers until allocations were refused.
 // The sets below are owned (+1) and released at the end of scope.
 - (void)removeAllObjects { NSMutableSet *fresh = [NSMutableSet new], *old;
-    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; _mru = NULL; os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
     for (id o in old) nvmtl_resref(o, -1); }
 - (id)copyWithZone:(NSZone *)z { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *c = [NVMTLResSet new];
@@ -199,7 +200,7 @@ static inline void nvmtl_resref(id o, int d) {
 // new owner, so each resource's residency count is unchanged; the new set's -dealloc gives it back.
 - (NVMTLResSet *)nvmtlTakeAll { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *taken = [NVMTLResSet new]; NSMutableSet *empty = taken->_s;
-    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; _mru = NULL; os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
     return taken; }
 - (void)dealloc { for (id o in _s) nvmtl_resref(o, -1); }
 @end
@@ -2639,8 +2640,8 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     }
     if(!_cb->_resources)_cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:selected];
     nvmtl_vk_cmd_bind_pipeline(&_cb->_c,&selected->_p);
-    nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX,   (NVMTLFunction *)_ps->_descriptor.vertexFunction,   _vbufAt);
-    nvmtl_bind_embedded(_cb, NVMTL_SET_FRAGMENT, (NVMTLFunction *)_ps->_descriptor.fragmentFunction, _fbufAt);
+    nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX,   (NVMTLFunction *)_ps->_descriptor.vertexFunction,   _vbufAt, _vbufOff);
+    nvmtl_bind_embedded(_cb, NVMTL_SET_FRAGMENT, (NVMTLFunction *)_ps->_descriptor.fragmentFunction, _fbufAt, _fbufOff);
     nvmtl_vk_cmd_bind_set(&_cb->_c,&selected->_p);
     return YES;
 }
@@ -2881,8 +2882,7 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     if (!nb) { nvlog("setVertexBuffer: nil at index %lu", (unsigned long)i); return; }
     if (!_cb->_resources) _cb->_resources = [NVMTLResSet new];
     [_cb->_resources addObject:nb];
-    if (!_vbufAt) _vbufAt = [NSMutableDictionary new];
-    _vbufAt[@(i)] = @[nb, @(off)];
+    if (i < NVMTL_NBUFAT) { _vbufAt[i] = nb; _vbufOff[i] = off; }
     nvtrace_floats("VB", (unsigned long)i, (unsigned long)off, nb->_b.map, 24);
     if (nvmtl_vk_bind_buffer(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, &nb->_b, off)) nvlog("setVertexBuffer: bind FAILED");
 }
@@ -2897,8 +2897,7 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     if (!nb) { nvlog("setFragmentBuffer: nil at index %lu", (unsigned long)i); return; }
     if (!_cb->_resources) _cb->_resources = [NVMTLResSet new];
     [_cb->_resources addObject:nb];
-    if (!_fbufAt) _fbufAt = [NSMutableDictionary new];
-    _fbufAt[@(i)] = @[nb, @(off)];
+    if (i < NVMTL_NBUFAT) { _fbufAt[i] = nb; _fbufOff[i] = off; }
     nvtrace_floats("FB", (unsigned long)i, (unsigned long)off, nb->_b.map, 16);
     if (nvmtl_vk_bind_buffer(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, &nb->_b, off)) nvlog("setFragmentBuffer: bind FAILED");
 }
@@ -2918,8 +2917,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
         [_cb->_scratch addObject:nb];
     }
-    if (set == NVMTL_SET_VERTEX)        { if (!_vbufAt) _vbufAt = [NSMutableDictionary new]; _vbufAt[@(i)] = @[nb, @(roff)]; }
-    else if (set == NVMTL_SET_FRAGMENT) { if (!_fbufAt) _fbufAt = [NSMutableDictionary new]; _fbufAt[@(i)] = @[nb, @(roff)]; }
+    if (i < NVMTL_NBUFAT && set == NVMTL_SET_VERTEX)        { _vbufAt[i] = nb; _vbufOff[i] = roff; }
+    else if (i < NVMTL_NBUFAT && set == NVMTL_SET_FRAGMENT) { _fbufAt[i] = nb; _fbufOff[i] = roff; }
 }
 - (void)setVertexBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self nvmtlBindBytes:b length:l atIndex:i set:NVMTL_SET_VERTEX]; }
 - (void)setFragmentBytes:(const void *)b length:(NSUInteger)l atIndex:(NSUInteger)i { [self nvmtlBindBytes:b length:l atIndex:i set:NVMTL_SET_FRAGMENT]; }
@@ -3266,7 +3265,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i {
     nvtrace("VBOFF[%lu] -> %lu", (unsigned long)i, (unsigned long)off);
-    { NSArray *b = _vbufAt[@(i)]; if (b) _vbufAt[@(i)] = @[b[0], @(off)]; }
+    if (i < NVMTL_NBUFAT && _vbufAt[i]) _vbufOff[i] = off;
     if (nvmtl_vk_bind_buffer_offset(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, off))
         nvlog("setVertexBufferOffset: nothing bound at vertex index %lu", (unsigned long)i);
 }
@@ -3290,7 +3289,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self setVertexBytes:b length:l atIndex:i]; [self nvmtlVertexStride:st atIndex:i]; }
 - (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i {
     nvtrace("FBOFF[%lu] -> %lu", (unsigned long)i, (unsigned long)off);
-    { NSArray *b = _fbufAt[@(i)]; if (b) _fbufAt[@(i)] = @[b[0], @(off)]; }
+    if (i < NVMTL_NBUFAT && _fbufAt[i]) _fbufOff[i] = off;
     if (nvmtl_vk_bind_buffer_offset(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, off))
         nvlog("setFragmentBufferOffset: nothing bound at fragment index %lu", (unsigned long)i);
 }
@@ -3387,7 +3386,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)nvmtlDumpBoundFragmentBuffers {
     {
-        NSDictionary *bound = [_fbufAt copy]; NSString *name = _dumpName;
+        NSMutableDictionary *bound = [NSMutableDictionary new]; NSString *name = _dumpName;
+        for (NSUInteger i = 0; i < NVMTL_NBUFAT; i++) if (_fbufAt[i]) bound[@(i)] = @[_fbufAt[i], @(_fbufOff[i])];
         [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 id<MTLDevice> dev = done.device; id<MTLCommandQueue> q = [dev newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -4194,7 +4194,7 @@ static void nvmtl_stride_dropped(NSUInteger st) { static BOOL said; if (!said &&
         _e78VarFor = _ps; _e78VarSel = selected;
     }
     nvmtl_retain_resource(_cb, selected);
-    nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX, _ps->_function, _bufAt);
+    nvmtl_bind_embedded_dict(_cb, NVMTL_SET_VERTEX, _ps->_function, _bufAt);
     return selected;
 }
 static int nvmtl_zprobe_on(void);
