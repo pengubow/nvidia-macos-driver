@@ -83,16 +83,24 @@ fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
         // only through a local object's fields gets one retry with its helpers inlined and those fields forwarded, and
         // samplers in argument buffers read from the sampler heap. Only a failure gets here, so a module that translates as
         // written never changes.
+        //
+        // A sampler in an argument buffer that also holds buffer pointers ("is not a sampler"), or in an array of samplers
+        // there ("exact sampler state was not recovered"), fails the same way with no helper to inline: it gets the retry
+        // on its text as written, its argument-buffer samplers read from the sampler heap.
         Err(e) if e.contains("sampler operand is a pointer") || e.contains("pointer placeholder")
-            || e.contains("missing pointer storage") =>
+            || e.contains("missing pointer storage") || e.contains("sampler operand is not a sampler") =>
         {
-            let Some(retry) = metal2vulkan::inline_and_forward_object_fields(ll) else { return Err(e) };
+            let inlined = metal2vulkan::inline_and_forward_object_fields(ll);
+            if inlined.is_none() && !e.contains("sampler operand") { return Err(e) }
+            let retry = inlined.as_deref().unwrap_or(ll);
             // NVMTL_DUMP_RETRY_LL=<file>: the retry's input text, to inspect what inlining and forwarding produced
             if let Some(path) = std::env::var_os("NVMTL_DUMP_RETRY_LL") {
-                let _ = std::fs::write(path, &retry);
+                let _ = std::fs::write(path, retry);
             }
-            metal2vulkan::with_argument_buffer_samplers(|| translate_one_as_written(&retry, st))
-                .map_err(|e2| format!("{e}; retry with helpers inlined and object fields forwarded: {e2}"))
+            let how = if inlined.is_some() { "with helpers inlined and object fields forwarded" }
+                      else { "with argument-buffer samplers from the sampler heap" };
+            metal2vulkan::with_argument_buffer_samplers(|| translate_one_as_written(retry, st))
+                .map_err(|e2| format!("{e}; retry {how}: {e2}"))
         }
         Err(e) => Err(e),
     }
