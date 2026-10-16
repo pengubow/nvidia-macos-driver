@@ -208,6 +208,8 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
     X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)
 static int g_dyn3;
 static int g_provoking;   /* provoking vertex is per-draw dynamic state, and the last vertex can provoke */
+static int g_divisor;     /* per-instance step rates (VK_KHR_vertex_attribute_divisor), up to g_max_divisor */
+static uint32_t g_max_divisor;
 static PFN_vkCmdSetProvokingVertexModeEXT pvkCmdSetProvokingVertexModeEXT;
 static int g_tess;
 static int g_indep;
@@ -768,21 +770,21 @@ static int nvmtl_vk_initialize(void)
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
 
-    static const char *kWant[15] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
+    static const char *kWant[16] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
                                     "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
                                     "VK_EXT_external_memory_host",
                                     "VK_EXT_image_drm_format_modifier",
                                     "VK_KHR_external_memory_fd",
                                     "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties",
-                                    "VK_EXT_provoking_vertex" };
-    const char *exts[15]; uint32_t next = 0; int have[15] = {0};
+                                    "VK_EXT_provoking_vertex", "VK_KHR_vertex_attribute_divisor" };
+    const char *exts[16]; uint32_t next = 0; int have[16] = {0};
     uint32_t na = 0;
     if (pvkEnumerateDeviceExtensionProperties &&
         pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, NULL) == VK_SUCCESS && na) {
         VkExtensionProperties *props = calloc(na, sizeof *props);
         if (props && pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, props) == VK_SUCCESS)
             for (uint32_t i = 0; i < na; i++)
-                for (int w = 0; w < 15; w++)
+                for (int w = 0; w < 16; w++)
                     if (!have[w] && !strcmp(props[i].extensionName, kWant[w])) { have[w] = 1; exts[next++] = kWant[w]; }
         free(props);
     }
@@ -841,6 +843,26 @@ static int nvmtl_vk_initialize(void)
         }
     }
     if (g_clip) dyn3.extendedDynamicState3DepthClipEnable = VK_TRUE;
+    /* MTLVertexStepFunctionPerInstance with a stepRate other than 1 is a binding divisor; Metal's base instance is
+       Vulkan's firstInstance, so non-zero first instances must work with it too. */
+    static VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divf;
+    if (have[15]) {
+        PFN_vkGetPhysicalDeviceFeatures2 gpf = (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFeatures2");
+        PFN_vkGetPhysicalDeviceProperties2 gpp = (PFN_vkGetPhysicalDeviceProperties2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceProperties2");
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR qd = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR };
+        VkPhysicalDeviceFeatures2 qf2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &qd };
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR dp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR };
+        VkPhysicalDeviceProperties2 pp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp };
+        if (gpf && gpp) { gpf(g_pdev, &qf2); gpp(g_pdev, &pp); }
+        g_divisor = qd.vertexAttributeInstanceRateDivisor && dp.supportsNonZeroFirstInstance;
+        g_max_divisor = dp.maxVertexAttribDivisor;
+        if (g_divisor) {
+            divf = (VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+                                                                        v12.pNext, VK_TRUE, VK_FALSE };
+            v12.pNext = &divf;
+        }
+    }
+    nvlog("vk: vertex step rates %s", g_divisor ? "ON (binding divisors)" : "OFF - per-instance data steps once per instance");
     {
         PFN_vkGetPhysicalDeviceFeatures2 gpf2 = (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFeatures2");
         VkPhysicalDeviceVulkan12Features q12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
@@ -3376,9 +3398,10 @@ static VkFormat nvmtl_vertex_vkformat(uint32_t mtl, int kind)
     return v;
 }
 static int nvmtl_vertex_input_build(const nvk_vertex_input *vin, const void *vs, size_t vn, VkVertexInputBindingDescription *vib, uint32_t *nvib,
-                                    VkVertexInputAttributeDescription *via, uint32_t *nvia, uint32_t *mask, uint32_t *dyn, uint32_t stv[32])
+                                    VkVertexInputAttributeDescription *via, uint32_t *nvia, VkVertexInputBindingDivisorDescriptionKHR *vdiv,
+                                    uint32_t *ndiv, uint32_t *mask, uint32_t *dyn, uint32_t stv[32])
 {
-    *nvib = *nvia = *mask = *dyn = 0; memset(stv, 0, 32 * sizeof *stv);
+    *nvib = *nvia = *ndiv = *mask = *dyn = 0; memset(stv, 0, 32 * sizeof *stv);
     uint8_t kind[32]; nvmtl_spv_input_kinds(vs, vn, kind);
     uint32_t described = 0;
     for (uint32_t k = 0; vin && k < vin->nattr && k < NVMTL_NVIN; k++) {
@@ -3395,8 +3418,12 @@ static int nvmtl_vertex_input_build(const nvk_vertex_input *vin, const void *vs,
         if (stride == NVMTL_STRIDE_DYNAMIC) { *dyn |= 1u << buf; stride = 0; }
         stv[buf] = stride;
         if (step > 2) { nvlog("G16 pipeline: vertex step function %u (per patch) is tessellation — not carried", step); return -1; }
-        if (step == 2 && vin->layout[buf].rate != 1) { static int said; if (said++ < 4) nvlog("G16 pipeline: per-instance step rate %u needs "
-            "VK_EXT_vertex_attribute_divisor, which is not wired — stepping once per instance", vin->layout[buf].rate); }
+        const uint32_t rate = vin->layout[buf].rate;
+        if (step == 2 && rate != 1) {
+            if (g_divisor && rate && rate <= g_max_divisor) vdiv[(*ndiv)++] = (VkVertexInputBindingDivisorDescriptionKHR){ buf, rate };
+            else { static int said; if (said++ < 4) nvlog("G16 pipeline: per-instance step rate %u needs VK_KHR_vertex_attribute_divisor "
+                "(%s) — stepping once per instance", rate, g_divisor ? "beyond its limit" : "absent"); }
+        }
         vib[*nvib] = (VkVertexInputBindingDescription){ buf, stride, step == 2 ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX }; (*nvib)++;
     }
     for (uint32_t l = 0; l < NVMTL_NVIN; l++) if (kind[l] && !(described & (1u << l))) { static int said; if (said++ < 8)
@@ -3928,8 +3955,9 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
               td->stepfn, td->scale_en, td->cpidx, (double)td->maxf, nvb, (int)pidloc, (int)td->inst_loc);
     }
     VkVertexInputBindingDescription vib[NVMTL_NVIN]; VkVertexInputAttributeDescription via[NVMTL_NVIN]; uint32_t nvib = 0, nvia = 0;
+    VkVertexInputBindingDivisorDescriptionKHR vdiv[NVMTL_NVIN]; uint32_t ndiv = 0;
     out->vin_dyn = 0;
-    if (!td && nvmtl_vertex_input_build(vin, vs, vn, vib, &nvib, via, &nvia, &out->vin_mask, &out->vin_dyn, out->vin_stride)) return -1;
+    if (!td && nvmtl_vertex_input_build(vin, vs, vn, vib, &nvib, via, &nvia, vdiv, &ndiv, &out->vin_mask, &out->vin_dyn, out->vin_stride)) return -1;
     if (out->vin_dyn && !pvkCmdBindVertexBuffers2) { nvlog("apps-dyn pipeline: layout(s) %#x are MTLBufferLayoutStrideDynamic and "
         "vkCmdBindVertexBuffers2 is not loaded — REFUSED", out->vin_dyn); return -1; }
     int hasDepth = rt->dfmt != 0;
@@ -3996,7 +4024,8 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
     VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, nsl, sl2, npc, npc ? pc : NULL };
     NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreatePipelineLayout(g_dev, &plci, NULL, &out->layout), "vkCreatePipelineLayout");
 
-    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, nvib, vib, nvia, via };
+    VkPipelineVertexInputDivisorStateCreateInfoKHR vdi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR, NULL, ndiv, vdiv };
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, ndiv ? &vdi : NULL, 0, nvib, vib, nvia, via };
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
         td ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE };
     VkPipelineTessellationStateCreateInfo tss = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, NULL, 0, 1 };
