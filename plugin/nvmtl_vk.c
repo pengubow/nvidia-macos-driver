@@ -4037,8 +4037,10 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
         dynsample[dsci.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
         dsci.pDynamicStates = dynsample;
     }
+    // Metal has no depth bias switch: setDepthBias always applies (and its zero default adds nothing), so the bias is
+    // enabled in every pipeline and its dynamic values decide.
     VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0,
-        VK_FALSE, rt->discard ? VK_TRUE : VK_FALSE, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f };
+        VK_FALSE, rt->discard ? VK_TRUE : VK_FALSE, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_TRUE, 0, 0, 0, 1.0f };
     if (rt->a2one && !g_a2one) { nvlog("pipeline REFUSED: alphaToOneEnabled and this device has no alphaToOne feature"); goto pipeline_failed; }
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0,
         (VkSampleCountFlagBits)(samples > 1 ? samples : 1), VK_FALSE, 0, NULL,
