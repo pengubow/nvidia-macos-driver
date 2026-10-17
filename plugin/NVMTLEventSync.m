@@ -301,6 +301,34 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+// MTLResourceSPI's isComplete (Apple's OpenGL asks it before it changes a texture from the CPU) answers for command
+// buffers that were committed: a use only encoded does not make a resource busy, and a command buffer that is never
+// committed never holds it. A commit raises the count of every buffer and texture its last part holds - each earlier
+// part's resources are put back into the recording (nvmtlSealPartWithSignal restart), so the last part names them all -
+// on the texture that owns the storage, and on the buffer under a texture made over one, which the GPU reads too.
+static void nvmtl_gpu_uses_raise(NVMTLCommandBuffer *cb, NVMTLSubmissionPart *last) {
+    if (![last isKindOfClass:[NVMTLSubmissionPart class]] || !last->resources.count) return;
+    NSMutableArray *uses = [NSMutableArray arrayWithCapacity:last->resources.count];
+    for (id o in (NVMTLResSet *)last->resources) {
+        NVMTLBuffer *b = nil;
+        if ([o isKindOfClass:[NVMTLTexture class]]) {
+            NVMTLTexture *t = o, *own = t->_parent ?: t;
+            __atomic_add_fetch(&own->_gpuRefs, 1, __ATOMIC_ACQ_REL); [uses addObject:own];
+            b = own->_backBuf ?: t->_backBuf;
+        } else if ([o isKindOfClass:[NVMTLBuffer class]]) b = o;
+        if (b) { __atomic_add_fetch(&b->_gpuRefs, 1, __ATOMIC_ACQ_REL); [uses addObject:b]; }
+    }
+    cb->_gpuUses = uses;
+}
+// at completion, after the status says so: a waitUntilComplete that returns finds the command buffer completed
+static void nvmtl_gpu_uses_lower(NVMTLCommandBuffer *cb) {
+    NSMutableArray *uses = cb->_gpuUses; cb->_gpuUses = nil;
+    for (id o in uses) {
+        if ([o isKindOfClass:[NVMTLTexture class]]) __atomic_sub_fetch(&((NVMTLTexture *)o)->_gpuRefs, 1, __ATOMIC_ACQ_REL);
+        else __atomic_sub_fetch(&((NVMTLBuffer *)o)->_gpuRefs, 1, __ATOMIC_ACQ_REL);
+    }
+}
+
 @implementation NVMTLCommandBuffer (EventSubmission)
 - (void)nvmtlReserveQueue {
     if (_reservation) return;
@@ -446,6 +474,7 @@ static int nvmtl_skip_empty_on(void) {
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];
+    nvmtl_gpu_uses_lower(self);
     [_parts removeAllObjects];
     // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
@@ -694,6 +723,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
+        nvmtl_gpu_uses_raise(self, _parts.lastObject);
     }
     // the commit's kernel marks can wait for the accelerator lock, so they go in outside the class lock (see
     // nvmtl_ws_mark_pending). This command buffer is committed and holds its queue reservation, but nothing submits it

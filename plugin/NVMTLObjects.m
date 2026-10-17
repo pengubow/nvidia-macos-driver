@@ -1373,6 +1373,8 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)d {
     return nil; }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
+    // a texture buffer has no image: its bytes are its buffer's (the slice variant reads them)
+    if (_tbView) { [self getBytes:bytes bytesPerRow:row bytesPerImage:0 fromRegion:region mipmapLevel:level slice:0]; return; }
     if (level >= [self mipmapLevelCount]) { nvlog("getBytes: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
     [self nvmtlSurfaceIn];
     nvmtl_census("getBytes", (uint32_t)region.size.width, (uint32_t)region.size.height, _surf != NULL);
@@ -1396,6 +1398,8 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (rc) nvlog("texture getBytes:slice: readback FAILED");
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
+    // a texture buffer has no image: its bytes are its buffer's (the slice variant writes them)
+    if (_tbView) { [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:0]; return; }
     if (level >= [self mipmapLevelCount]) { nvlog("replaceRegion: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
     if (region.size.depth > 1 || region.origin.z) { [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row * region.size.height]; return; }
     { int was = nvtrace_scope([self nvi]->w, [self nvi]->h);
@@ -1733,6 +1737,27 @@ static NSDictionary *nvmtl_ci_stitch_entry(NVMTLFunction *fn)
     }
 }
 @implementation NVMTLFunction
+// The function constants an entry's AIR declares (its !air.function_constants rows): name, AIR type, index and whether
+// the function needs a value (no is_function_constant_defined guards it). rows: how many MTL_FC_INIT rows there are in
+// all, to tell a row this does not read from none.
+static NSArray<NSDictionary *> *nvmtl_air_function_constants(NSString *air, NSUInteger *rows)
+{
+    static NSRegularExpression *row, *any; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        row = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_[^\\n]*, !\"([^\"]+)\", !\"([^\"]+)\", i32 ([0-9]+), i1 (true|false)\\}$" options:NSRegularExpressionAnchorsMatchLines error:NULL];
+        any = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_" options:NSRegularExpressionAnchorsMatchLines error:NULL];
+    });
+    NSMutableArray *out = [NSMutableArray new];
+    if (rows) *rows = 0;
+    if (!air.length) return out;
+    NSRange all = NSMakeRange(0, air.length);
+    if (rows) *rows = [any numberOfMatchesInString:air options:0 range:all];
+    for (NSTextCheckingResult *r in [row matchesInString:air options:0 range:all])
+        [out addObject:@{ @"type": [air substringWithRange:[r rangeAtIndex:1]], @"name": [air substringWithRange:[r rangeAtIndex:2]],
+                          @"index": @([[air substringWithRange:[r rangeAtIndex:3]] longLongValue]),
+                          @"required": @([[air substringWithRange:[r rangeAtIndex:4]] isEqualToString:@"true"]) }];
+    return out;
+}
 - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary {
     static char key;
     NSDictionary *cached = objc_getAssociatedObject(self, &key);
@@ -1744,19 +1769,13 @@ static NSDictionary *nvmtl_ci_stitch_entry(NVMTLFunction *fn)
     } else if (!ci || ![ci instancesRespondToSelector:@selector(initWithName:type:index:required:)]) {
         static int said; if (!said++) nvlog("functionConstantsDictionary: this Metal has no MTLFunctionConstantInternal initWithName:type:index:required: - answering EMPTY (said once)");
     } else {
-        static NSRegularExpression *row, *any; static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            row = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_[^\\n]*, !\"([^\"]+)\", !\"([^\"]+)\", i32 ([0-9]+), i1 (true|false)\\}$" options:NSRegularExpressionAnchorsMatchLines error:NULL];
-            any = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_" options:NSRegularExpressionAnchorsMatchLines error:NULL];
-        });
-        NSRange all = NSMakeRange(0, _air.length);
-        NSArray<NSTextCheckingResult *> *ms = [row matchesInString:_air options:0 range:all];
-        NSUInteger rows = [any numberOfMatchesInString:_air options:0 range:all];
+        NSUInteger rows = 0;
+        NSArray<NSDictionary *> *ms = nvmtl_air_function_constants(_air, &rows);
         if (rows != ms.count) { static int said; if (!said++) nvlog("functionConstantsDictionary: \"%s\" has %lu MTL_FC_INIT rows, %lu in the measured shape - the AIR row moved; the rest are NOT answered (said once)", _fname.UTF8String ?: "?", (unsigned long)rows, (unsigned long)ms.count); }
-        for (NSTextCheckingResult *r in ms) {
-            NSString *ty = [_air substringWithRange:[r rangeAtIndex:1]], *nm = [_air substringWithRange:[r rangeAtIndex:2]];
-            NSUInteger ix = (NSUInteger)[[_air substringWithRange:[r rangeAtIndex:3]] longLongValue];
-            BOOL req = [[_air substringWithRange:[r rangeAtIndex:4]] isEqualToString:@"true"];
+        for (NSDictionary *r in ms) {
+            NSString *ty = r[@"type"], *nm = r[@"name"];
+            NSUInteger ix = [r[@"index"] unsignedIntegerValue];
+            BOOL req = [r[@"required"] boolValue];
             MTLDataType dt = nvmtl_air_fc_type(ty);
             if (dt == MTLDataTypeNone) { static int said; if (!said++) nvlog("functionConstantsDictionary: AIR type \"%s\" (constant %s) has no MTLDataType mapping - answered as None (said once)", ty.UTF8String, nm.UTF8String); }
             id c = [(id<NVMTLFunctionConstantInit>)[ci alloc] initWithName:nm type:(NSUInteger)dt index:ix required:req];
@@ -1953,6 +1972,13 @@ static MTLBindingAccess nvmtl_access_for(id a) {
     if ([s isEqualToString:@"WriteOnly"]) return MTLBindingAccessWriteOnly;
     return MTLBindingAccessReadOnly;
 }
+// an AIR access qualifier (nvmtl_air_names' access), or fallback when there is none
+static MTLBindingAccess nvmtl_access_for_air(id q, MTLBindingAccess fallback) {
+    if (![q isKindOfClass:[NSString class]]) return fallback;
+    if ([q isEqualToString:@"read_write"]) return MTLBindingAccessReadWrite;
+    if ([q isEqualToString:@"write"]) return MTLBindingAccessWriteOnly;
+    return MTLBindingAccessReadOnly;   // read, sample
+}
 static MTLTextureType nvmtl_textype_for_shape(id shape) {
     NSString *s = [shape isKindOfClass:[NSString class]] ? shape : [shape description];
     if (!s.length) return MTLTextureType2D;
@@ -1970,7 +1996,8 @@ static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger 
     a->_type = MTLArgumentTypeBuffer; a->_index = index; a->_active = nvmtl_binding_active(binding); a->_arrayLength = 1; a->_bufAlign = 16;
     NSString *key = [NSString stringWithFormat:@"buffer:%lu", (unsigned long)index];
     a->_name = names[@"args"][key] ?: [NSString stringWithFormat:@"buffer%lu", (unsigned long)index];
-    a->_access = nvmtl_access_for(binding[@"access"]);
+    a->_access = nvmtl_access_for_air(names[@"access"][key], nvmtl_access_for(binding[@"access"]));
+    { NSNumber *al = names[@"align"][key]; if ([al isKindOfClass:[NSNumber class]] && al.unsignedIntegerValue) a->_bufAlign = al.unsignedIntegerValue; }
     id ds = binding[@"declared_size"]; a->_bufSize = [ds isKindOfClass:[NSNumber class]] ? [ds unsignedLongValue] : 0;
     NSMutableArray *members = [NSMutableArray new];
     NSDictionary *memberNames = names[@"members"], *types = names[@"types"];
@@ -2060,9 +2087,21 @@ NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn)
                 [out addObject:nvmtl_build_buffer_argument(fn, idx, b, refl, names)];
             } else if ([kind isEqualToString:@"Texture"] || [kind isEqualToString:@"TextureArray"] || [kind isEqualToString:@"StorageImage"]) {
                 NVMTLArgument *a = [NVMTLTextureArgument new]; a->_type = MTLArgumentTypeTexture; a->_index = idx; a->_active = nvmtl_binding_active(b);
-                a->_name = names[@"args"][[NSString stringWithFormat:@"texture:%lu", (unsigned long)idx]] ?: [NSString stringWithFormat:@"texture%lu", (unsigned long)idx];
-                a->_access = [kind isEqualToString:@"StorageImage"] ? MTLBindingAccessReadWrite : nvmtl_access_for(b[@"access"]);
+                NSString *key = [NSString stringWithFormat:@"texture:%lu", (unsigned long)idx];
+                a->_name = names[@"args"][key] ?: [NSString stringWithFormat:@"texture%lu", (unsigned long)idx];
+                a->_access = nvmtl_access_for_air(names[@"access"][key], [kind isEqualToString:@"StorageImage"] ? MTLBindingAccessReadWrite : nvmtl_access_for(b[@"access"]));
                 a->_texType = nvmtl_textype_for_shape(b[@"texture_shape"]); a->_texDataType = MTLDataTypeFloat;
+                // the AIR type name (texture2d<half, sample>, depth2d<float, sample>): its component type, and depth
+                NSString *tn = names[@"types"][key];
+                NSRange lt = tn ? [tn rangeOfString:@"<"] : NSMakeRange(NSNotFound, 0);
+                if (lt.location != NSNotFound) {
+                    NSString *rest = [tn substringFromIndex:NSMaxRange(lt)];
+                    NSRange end = [rest rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@",>"]];
+                    const MTLDataType dt = nvmtl_datatype_for_air_name([rest substringToIndex:end.location == NSNotFound ? rest.length : end.location]);
+                    if (dt == MTLDataTypeFloat || dt == MTLDataTypeHalf || dt == MTLDataTypeInt || dt == MTLDataTypeUInt || dt == MTLDataTypeShort
+                        || dt == MTLDataTypeUShort || dt == MTLDataTypeChar || dt == MTLDataTypeUChar) a->_texDataType = dt;
+                    a->_depth = [tn hasPrefix:@"depth"];
+                }
                 id loc = b[@"descriptor"]; a->_arrayLength = [loc isKindOfClass:[NSDictionary class]] && [loc[@"count"] unsignedLongValue] > 1 ? [loc[@"count"] unsignedLongValue] : 1;
                 [out addObject:a];
             } else if ([kind isEqualToString:@"Sampler"]) {
@@ -2098,12 +2137,12 @@ static NSArray *nvmtl_stage_in_arguments(MTLRenderPipelineDescriptor *d)
         MTLVertexAttributeDescriptor *at = vd.attributes[i]; if (at.format == MTLVertexFormatInvalid) continue;
         [bufs addIndex:at.bufferIndex]; if ([used containsObject:@(i)]) [live addIndex:at.bufferIndex];
     }
-    NSMutableArray *out = [NSMutableArray array]; __block NSUInteger n = 0;
+    NSMutableArray *out = [NSMutableArray array];
     [bufs enumerateIndexesUsingBlock:^(NSUInteger bi, BOOL *stop) {
         NVMTLStageInArgument *a = [NVMTLStageInArgument new];
         a->_type = MTLArgumentTypeBuffer; a->_index = bi; a->_active = [live containsIndex:bi]; a->_arrayLength = 1; a->_bufAlign = 4;
         a->_access = MTLBindingAccessReadOnly; a->_bufSize = vd.layouts[bi].stride; a->_bufDataType = MTLDataTypeStruct;
-        a->_name = [NSString stringWithFormat:@"vertexBuffer.%lu", (unsigned long)n++];
+        a->_name = [NSString stringWithFormat:@"vertexBuffer.%lu", (unsigned long)bi];   // named by its buffer index, as Apple's are
         [out addObject:a];
     }];
     return out;
@@ -2368,6 +2407,20 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         }
         vals=((id(*)(id,SEL))objc_msgSend)(merged,sel);
         nvlog("named constants: %s applied %lu of %lu, merged %lu",name.UTF8String,(unsigned long)applied,(unsigned long)named.count,(unsigned long)vals.count);
+    }
+    // a constant the function needs (no is_function_constant_defined guards it) and no value given: no function, and an
+    // error that names it, as Apple's compiler answers
+    if (_airs[name]) {
+        NSMutableIndexSet *given = [NSMutableIndexSet indexSet];
+        for (id v in vals) { Ivar ii = class_getInstanceVariable([v class], "_index");
+            if (ii) [given addIndex:*(const NSUInteger *)((const uint8_t *)(__bridge void *)v + ivar_getOffset(ii))]; }
+        for (NSDictionary *c in nvmtl_air_function_constants(_airs[name], NULL)) {
+            if (![c[@"required"] boolValue] || [given containsIndex:[c[@"index"] unsignedIntegerValue]]) continue;
+            NSString *why = [NSString stringWithFormat:@"Function %@ has a function constant %@ (index %@) with no value", name, c[@"name"], c[@"index"]];
+            nvlog("newFunctionWithName:constantValues: %s", why.UTF8String);
+            if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{ NSLocalizedDescriptionKey: why }];
+            return nil;
+        }
     }
     if (vals.count == 0 && ([_stages[name] isEqualToString:@"mesh"] || [_stages[name] isEqualToString:@"object"]) && _airs[name]) {
         nvlog("newFunctionWithName:constantValues: \"%s\" is a %s function - %zu constant(s) DEFERRED to the mesh pipeline",

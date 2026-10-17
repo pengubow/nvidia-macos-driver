@@ -7154,30 +7154,34 @@ int nvmtl_vk_cmd_image_gen_mipmaps(nvk_cmdbuf *c, nvk_image *img)
     nvmtl_vk_cmd_barrier(c);
     img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    int32_t mw = (int32_t)img->w, mh = (int32_t)img->h;
+    // every slice of an array and every face of a cube gets its levels; a 3D texture (its depth in layers) halves in
+    // depth too
+    const int vol = img->mtl_type == 7;
+    const uint32_t layers = vol || !img->layers ? 1 : img->layers;
+    int32_t mw = (int32_t)img->w, mh = (int32_t)img->h, md = vol && img->layers ? (int32_t)img->layers : 1;
     for (uint32_t i = 1; i < img->mips; i++) {
-        VkImageSubresourceRange src = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1 };
+        VkImageSubresourceRange src = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, layers };
         VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, src };
         pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toSrc);
-        int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
-        VkImageBlit b = { { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1 }, { { 0, 0, 0 }, { mw, mh, 1 } },
-                          { VK_IMAGE_ASPECT_COLOR_BIT, i,     0, 1 }, { { 0, 0, 0 }, { nw, nh, 1 } } };
+        int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1, nd = md > 1 ? md / 2 : 1;
+        VkImageBlit b = { { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, layers }, { { 0, 0, 0 }, { mw, mh, md } },
+                          { VK_IMAGE_ASPECT_COLOR_BIT, i,     0, layers }, { { 0, 0, 0 }, { nw, nh, nd } } };
         pvkCmdBlitImage(c->cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-        mw = nw; mh = nh;
+        mw = nw; mh = nh; md = nd;
     }
     VkImageMemoryBarrier fin[2] = {
         { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img,
-          { VK_IMAGE_ASPECT_COLOR_BIT, 0, img->mips - 1, 0, 1 } },
+          { VK_IMAGE_ASPECT_COLOR_BIT, 0, img->mips - 1, 0, layers } },
         { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img,
-          { VK_IMAGE_ASPECT_COLOR_BIT, img->mips - 1, 1, 0, 1 } },
+          { VK_IMAGE_ASPECT_COLOR_BIT, img->mips - 1, 1, 0, layers } },
     };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, fin);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

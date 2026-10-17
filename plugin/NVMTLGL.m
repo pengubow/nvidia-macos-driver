@@ -136,13 +136,19 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d) {
 @implementation NVMTLCommandBuffer (NVMTLGL)
 - (void)commitAndHold { [self commit]; }
 @end
+// Complete: no committed command buffer still uses the resource (_gpuRefs, raised at commit and lowered at completion,
+// NVMTLEventSync.m). A texture made over a buffer shares that buffer's memory, so the buffer's uses count for it too.
+static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE) == 0; }
+static BOOL nvmtl_tex_idle(NVMTLTexture *t) {
+    NVMTLTexture *own = t->_parent ? t->_parent : t; NVMTLBuffer *b = own->_backBuf ?: t->_backBuf;
+    return nvmtl_sel1_idle(&own->_gpuRefs) && (!b || nvmtl_sel1_idle(&b->_gpuRefs));
+}
 @implementation NVMTLTexture (NVMTLGL)
 - (void)waitUntilComplete {
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    NVMTLTexture *own = _parent ? _parent : self;
-    while (__atomic_load_n(&own->_resRefs, __ATOMIC_ACQUIRE) > 0) {
+    while (!nvmtl_tex_idle(self)) {
         if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 > 10000000000ull) {
-            nvlog("GL: waitUntilComplete gave up after 10 s - %d command buffer(s) still name this texture", __atomic_load_n(&own->_resRefs, __ATOMIC_ACQUIRE));
+            nvlog("GL: waitUntilComplete gave up after 10 s - a committed command buffer still uses this texture");
             return;
         }
         usleep(50);
@@ -150,19 +156,18 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d) {
 }
 @end
 
-static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE) == 0; }
 @implementation NVMTLTexture (NVMTLSel1)
-- (BOOL)isComplete { NVMTLTexture *o = _parent ? _parent : self; return nvmtl_sel1_idle(&o->_resRefs); }
-- (BOOL)isWriteComplete { NVMTLTexture *o = _parent ? _parent : self; return nvmtl_sel1_idle(&o->_resRefs); }
+- (BOOL)isComplete { return nvmtl_tex_idle(self); }
+- (BOOL)isWriteComplete { return nvmtl_tex_idle(self); }
 @end
 @implementation NVMTLBuffer (NVMTLSel1)
-- (BOOL)isComplete { return nvmtl_sel1_idle(&_resRefs); }
-- (BOOL)isWriteComplete { return nvmtl_sel1_idle(&_resRefs); }
+- (BOOL)isComplete { return nvmtl_sel1_idle(&_gpuRefs); }
+- (BOOL)isWriteComplete { return nvmtl_sel1_idle(&_gpuRefs); }
 - (void)waitUntilComplete {
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    while (!nvmtl_sel1_idle(&_resRefs)) {
+    while (!nvmtl_sel1_idle(&_gpuRefs)) {
         if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 > 10000000000ull) {
-            nvlog("waitUntilComplete (buffer) gave up after 10 s - %d command buffer(s) still name it", __atomic_load_n(&_resRefs, __ATOMIC_ACQUIRE));
+            nvlog("waitUntilComplete (buffer) gave up after 10 s - %d committed command buffer use(s) still name it", __atomic_load_n(&_gpuRefs, __ATOMIC_ACQUIRE));
             return;
         }
         usleep(50);

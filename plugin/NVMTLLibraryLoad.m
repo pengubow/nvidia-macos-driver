@@ -1396,7 +1396,10 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
         if (fn->_airNames) return fn->_airNames;
         NSMutableDictionary *args = [NSMutableDictionary new], *members = [NSMutableDictionary new], *types = [NSMutableDictionary new];
         NSMutableDictionary *plain = [NSMutableDictionary new];
-        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain };
+        // access: each buffer's and texture's AIR access qualifier (read, read_write, write, sample); align: each buffer's
+        // air.arg_type_align_size. Both as the source declares them, which is what Apple's reflection reports.
+        NSMutableDictionary *access = [NSMutableDictionary new], *align = [NSMutableDictionary new];
+        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain, @"access": access, @"align": align };
         NSString *ll = fn->_air, *fname = fn->_fname;
         if (!ll.length || !fname.length) return fn->_airNames;
         NSMutableDictionary *nodes = [NSMutableDictionary new];
@@ -1431,6 +1434,9 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
             NSString *k = [NSString stringWithFormat:@"%@:%ld", kind, (long)loc];
             args[k] = name;
             NSString *tn = nvmtl_air_quoted_after(line, @"air.arg_type_name", 0); if (tn) types[k] = tn;
+            for (NSString *q in @[@"read_write", @"read", @"write", @"sample"])
+                if ([line rangeOfString:[NSString stringWithFormat:@"!\"air.%@\"", q]].location != NSNotFound) { access[k] = q; break; }
+            const NSInteger al = nvmtl_air_i32_after(line, @"air.arg_type_align_size"); if (al > 0) align[k] = @(al);
             if ([kind isEqualToString:@"buffer"]) {
                 NSString *st = nvmtl_air_node_after(line, @"air.struct_type_info", 0, NULL);
                 if (st) nvmtl_air_walk_struct(nodes, st, [NSString stringWithFormat:@"%ld", (long)loc], members, types, [NSMutableSet new]);
