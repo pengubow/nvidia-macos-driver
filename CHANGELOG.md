@@ -1,5 +1,130 @@
 # Changelog
 
+## 2.3.4
+
+Pre-release for the early-updates testers; it becomes the general release only after every GPU generation passes the
+field gate.
+
+Stability
+- Window dragging, Launchpad and games stutter less: each screen update waits at most one refresh period for the
+  previous one, instead of a fixed tenth of a second; the wait wakes on the display's own event
+- macOS Sequoia screenshots and window captures: the capture ordering fix from 2.3.2 returns, and it now follows what the
+  installed kernel driver supports, so a Metal driver and a kernel driver from different versions never mismatch again
+- Turing (GTX 16 and RTX 20): the login screen no longer stays black with a cursor when the first frame has not been
+  drawn yet; the driver only shows video memory the Metal driver has written
+- Turing: the ten-second start wait the installer used to add is now the driver's own default, so a laptop card or a Mac
+  whose boot arguments were rewritten gets it too (a value you set yourself still wins)
+- Laptops with a hybrid display: the driver no longer copies the boot screen from another card's memory, which could
+  stop the Mac during startup. When WhateverGreen is present next to the driver, the installer notes the gfxrst setting it needs
+- A Mac reset during the driver's own start-up wait (the ten-second Turing settle, the 100-second wait when the card's
+  memory window cannot be moved) no longer counts toward switching the driver off. Two such resets used to leave a
+  working Mac on the fallback driver, reported at the next login as "driver loaded: no"
+- A GPU that is busy is not a GPU that is gone: the Metal driver keeps waiting for a late frame instead of disabling
+  itself for the rest of the process. In WindowServer that disablement meant every later command buffer was refused
+  and the session restarted ("Failed to get a MTLCommandBuffer")
+- Every kernel driver now carries the package version. A Mac that still runs an older kernel driver after an update
+  (the kernel collection was not rebuilt) is named in Send logs and in the "reached the desktop" report instead of
+  counting as the new version
+
+Logging (so a report says what happened)
+- The kernel driver logs its own version at start
+- A full video-memory window logs the first refusals and then every 256th, with one line saying who holds the window
+- Spare framebuffer instances (more instances than displays) say so instead of reporting a failure
+- A display that stops flipping logs how long the frame had been pending and the flip counters
+- Every ten seconds of screen activity, one line per display records the flip rate against the panel rate, missed
+  refreshes and skipped frames
+- A refused mode set or flip in the kernel names the stage that refused it
+- The Metal driver says why it could not begin a command buffer (a lost GPU, a failed allocation), the line
+  WindowServer crashes without
+
+## 2.3.3
+
+Stability
+- 2.3.2 made some Macs worse: blank or torn windows and a Dock missing its apps on macOS Sequoia, WindowServer
+  crashes on some Tahoe desktops. Its display changes (screenshots and the lock screen, the brightness and video-memory
+  logging, the Turing flip change) are withdrawn from the package until they pass a staged test with the testers.
+  2.3.3 ships the 2.3.1 driver, which has the longest clean record in the field, on both macOS 15 and macOS 26
+- macOS Sequoia: installing and updating works again (the 2.3.2 fix is kept: the Metal driver is built for macOS 15)
+- After a rollback, the installed version record follows the files that are really installed (kept from 2.3.2)
+
+## 2.3.2
+
+Fixes
+- macOS Sequoia: installing or updating to 2.3.0 or 2.3.1 stopped with "runtime payload requires macOS 26.0.0". The
+  Metal driver in those packages was built for macOS 26 only; it is built for macOS 15 again, and a release can no
+  longer ship anything that needs a newer macOS than 15
+- Screenshots, window captures and the lock screen showed a blurred or empty window. macOS reads a window right
+  after drawing it, and the driver now finishes the drawing first, as Apple's drivers do
+- Send logs now includes how much of the card's video memory window is in use, so a black screen with only a
+  cursor can be told apart from a leak
+- After an update was rolled back, Send logs still named the new version. The installed version now follows the files
+  that are actually installed, so reports say what your Mac is really running
+- The Metal driver never hands the GPU a missing texture or sampler; it uses an empty one and logs it (a cause of
+  Safari crashes in older versions)
+- Laptops with the screen on the NVIDIA GPU: every step of the brightness setup is logged, so brightness that stays
+  greyed out can be traced from Send logs
+
+AMD / Intel test program
+- A test driver that fails to start no longer panics the Mac: memory still mapped when the start gave up is kept
+  until it is unmapped, instead of being freed under the mapping
+- Intel 11th and 12th gen graphics (Tiger Lake, Rocket Lake, Alder Lake-S) and DG1 now reach the Intel driver. Two
+  drivers list these chips and the device was offered to the wrong one, so neither took it
+- When a start fails, its first error lines are kept and reported on the next start, even if the Mac stopped
+- The test driver's log names AMD and Intel devices correctly
+
+## 2.3.1
+
+Safer updates
+- If an update cannot bring your display up, your Mac no longer stays on a black screen. After two starts in a row
+  that never reached the display, the driver turns itself off so macOS still starts, and the driver you had before the
+  update is put back automatically with one restart. Nothing stays running once an update has worked
+- Releases now also have to pass app checks on the new Metal driver (Terminal text, window capture) and may not do
+  worse than the release before
+
+## 2.3.0
+
+Fixes
+- Plugging a different monitor into the same port: macOS sees the new monitor (its name, size and modes) instead
+  of keeping the one it replaced
+- Terminal and other apps that draw text with programmable blending: text no longer comes out missing or garbled
+  (GTX 16 and others). Draws that read colour from a pass without every attachment were skipped; they are now drawn,
+  and overlapping triangles in one draw read each other's colour in order (thanks pengubow)
+- Above 60 Hz: the display and the accelerator woke up once per millisecond to check for a finished flip, which
+  users' flicker recordings showed as about 56 flips a second on a 143 Hz panel while windows moved. They now wake on
+  the flip itself (the display on macOS 15 and 26, the accelerator on macOS 26)
+- When a display's mode set is refused, the driver now tries the mode the firmware is already running before giving
+  up, and the log says why the mode was refused (reports of a black screen at login on some RTX 3060 boards)
+- Draws the Metal driver had to drop are now in the logs that Send logs collects
+
+AMD / Intel test program
+- 1401 can join the AMD and Intel GPU test program (AMD/Intel panel, Join). Testers get the newest signed test build
+  of the AMD/Intel driver, and after every restart 1401 sends what the driver did, so a start that hangs or panics
+  still reaches us. Leave the program from the same panel at any time
+
+## 2.2.0
+
+This release makes the driver do one thing: drive NVIDIA GPUs. Everything else it used to carry is now its own
+product or is gone, which makes the package smaller, leaves less running on your Mac, and leaves less to go wrong.
+
+Leaner
+- The package carries the NVIDIA driver only: the AMD/Intel GPU driver, the NPU driver and the audio driver are
+  separate products with their own packages and installers (the package drops from about 1 GB)
+- The boot logo is gone: the OpenCore logo driver, the boot progress screen and the display driver's code that kept
+  the logo on screen. Installing, updating or removing the driver takes an existing logo out of OpenCore
+- Three background jobs are gone: a display tracker that streamed the driver's log all the time, a WindowServer
+  restart at every boot (a flicker workaround from before the flicker fix in 2.1.0), and a crash-check login item.
+  Logs are collected only when you press Send logs. Installing or removing the driver takes out what an earlier
+  version left
+- The 1401 Mac app moved to the 1401 project; it installs this driver with the package's own installer
+
+Fixes
+- A display whose firmware boot timing NVIDIA's display code does not accept (seen on an RTX 3060 at 1920x1080) now
+  switches to the validated timing for the same resolution instead of crashing WindowServer at login
+- Checksum lists are checked strictly: a malformed line in SHA256SUMS used to be skipped while the check still passed
+- install.sh fixes PATH before running anything as root, like uninstall.sh
+- Crash reports sent with Send logs keep the library identifiers needed to read them (machine identifiers are still
+  removed)
+
 ## 2.1.0
 
 Driver

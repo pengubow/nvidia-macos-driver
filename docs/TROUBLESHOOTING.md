@@ -53,6 +53,7 @@ stick made by an old 1401 keeps the old problem until you make it again.
 | Photos / face detection keeps crashing (mediaanalysisd) | A Metal object was freed twice in our driver. | Fixed in 1.14. |
 | Hardware video encoding off on RTX 5070 Ti and similar cards | The card has no first encoder engine, and the encoder only tried that one. | Fixed in the encoder (it uses the first engine the card has). |
 | "Quadro T1200 / T-series … is older than the driver supports" | The installer's list did not include every Turing workstation card. | Fixed in 1.14: every Turing or newer card is accepted. |
+| Kernel panic as the login screen appears (WindowServer, `IOFramebuffer::postOpen`, page fault in `memcpy`), with WhateverGreen installed | WhateverGreen copies the boot screen on the first framebuffer start from an address it saved at boot. macOS can free that mapping before the NVIDIA display opens (seen on a laptop whose boot screen is on the Intel GPU). | Add `gfxrst=4` to boot-args. It turns that copy off; the driver draws its own start-up screen. |
 | The app edits the wrong OpenCore partition | Two OpenCore partitions on the macOS disk. | Fixed in 1.14 (the boot arguments decide which one started the Mac). |
 
 ### Several NVIDIA cards
@@ -79,9 +80,9 @@ and rebuilds the final collection from permanent installation paths.
   macOS Recovery (the driver cannot run there), open **Terminal**, run
   `nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove=1`, then restart into macOS. The Mac removes the driver by
   itself, with no picture needed, and restarts clean. This is the same removal the picker entry runs.
-- Boot logo: disabled by default. Driver installation and updates disable an existing logo entry because it can
-  prevent firmware from reaching the picker. Enable it only for a deliberate test. If the picker never appears, disable
-  `NullMothLogo.efi` in the EFI configuration from another operating system; a boot argument cannot repair a pre-picker hang.
+- Boot logo: earlier versions could add `NullMothLogo.efi` to OpenCore. It is no longer part of the driver; installing,
+  updating or removing the driver takes its entry and file out. If the picker never appears on an EFI that still has
+  it, disable that entry in the EFI configuration from another operating system.
 
 ## 5. GPUs the driver does not cover yet
 

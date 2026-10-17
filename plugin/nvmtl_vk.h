@@ -66,7 +66,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *dcache[32]; void *dcachepool; unsigned ndcache;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
                  void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
-                 unsigned fetch_draw, topo;   /* the bound pipeline reads [[color(n)]] inside this pass; last MTLPrimitiveType set */
+                 unsigned fetch_draw, topo;   /* the bound pipeline reads [[color(n)]] in this pass; last MTLPrimitiveType set */
                  /* stencil export emulation (nvmtl_semu_draw): the bound pipeline's layout when it exports stencil, and the
                     stencil reference / write masks / depth write last set, which each per-bit pass changes and restores */
                  void *semu_layout; uint32_t st_ref[2], st_wmask[2]; int depth_write;
@@ -78,9 +78,6 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
-                 unsigned restart_off;  /* GL turned primitive restart off (setPrimitiveRestartEnabled:NO) */
-                 uint32_t dyn_out[2];   /* address-table dynamic offset of the set the last snapshot returned, per stage */
-                 void *tab_out[2];      /* the table page buffer that set's descriptor names */
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
@@ -160,8 +157,6 @@ int  nvmtl_vk_cmd_copy_occlusion(nvk_cmdbuf *c, uint32_t first, uint32_t count, 
 int  nvmtl_vk_have_polygon_mode(void);
 int  nvmtl_vk_cmd_set_depth_clip(nvk_cmdbuf *c, int clip);
 int  nvmtl_vk_cmd_set_polygon_mode(nvk_cmdbuf *c, int line);
-int  nvmtl_vk_have_provoking_last(void);
-void nvmtl_vk_cmd_set_provoking_last(nvk_cmdbuf *c, int last);
 void nvmtl_vk_cmd_set_blend_color(nvk_cmdbuf *c, const float rgba[4]);
 void nvmtl_vk_cmd_set_stencil_ref(nvk_cmdbuf *c, uint32_t front, uint32_t back);
 void nvmtl_vk_cmd_set_depth_bias(nvk_cmdbuf *c, float constant, float slope, float clamp);
@@ -352,4 +347,6 @@ int nvmtl_vk_cmd_image_gen_mipmaps(nvk_cmdbuf *c, nvk_image *img);
 int nvmtl_vk_surface_share_on(void);
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out);
 int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
+int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
+int nvmtl_vk_accel_surface_wait(void);

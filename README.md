@@ -1,7 +1,8 @@
 # NullMoth NVIDIA Driver for macOS
 
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
-kernel extensions, the Metal plugin, the shader translator and the Mac app are all in this repository.
+kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it
+(Mac and Windows) is its own project: [1401](https://github.com/nullmoth/1401).
 
 Supported cards are Turing and newer: GTX 16, RTX 20, 30, 40 and 50, TITAN RTX, Quadro RTX and the T-series. Most
 testing is done on an RTX 5060, so other cards may have problems that haven't been found yet. See
@@ -125,6 +126,8 @@ Also required:
 - **BIOS:** Above 4G Decoding ON (the card maps memory above 4 GB), CSM OFF.
 - **SMBIOS:** a Mac model that runs macOS 15 with a discrete GPU (tested: `iMacPro1,1`, which 1401 uses).
 - **Remove** any `nv_disable=1`, WhateverGreen NVIDIA patches, or `agdpmod=pikera` for this card.
+- **With WhateverGreen installed** (for an Intel or AMD GPU), add `gfxrst=4` to boot-args. Without it, WhateverGreen's
+  boot screen copy can read freed memory when the NVIDIA display opens, and the Mac panics.
 - **No `DeviceProperties`** are needed for the NVIDIA card.
 
 Verify after the reboot:

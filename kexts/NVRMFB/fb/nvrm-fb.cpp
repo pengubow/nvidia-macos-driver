@@ -212,6 +212,11 @@ void NVRMBacklightHandler::applyFire(thread_call_param_t p, thread_call_param_t)
     else BLLOG("backlight: setting %u%% failed (0x%x)", (unsigned)percent, r);
 }
 
+// 1 once this boot's guard clear happened (a head lit, or nothing to light): NVRM reads it (debug.nvrmfb_guard_cleared)
+// before putting its start count back after a settle wait, so a display brought up by hand during the wait is not
+// counted as a failed start (nvrm_off.h).
+static int gGuardCleared;
+static void fbGuardCleared(const char *why);
 class NVRMNVDAFramebuffer : public IOFramebuffer {
     OSDeclareDefaultStructors(NVRMNVDAFramebuffer)
     struct NvKmsKapiFunctionsTable *fKms = nullptr; NvU32 fGpuId = 0; nvrm_phys_for_va_t fPhysForVa = nullptr;
@@ -223,28 +228,21 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NVRMBacklightHandler *fBacklight = nullptr;   // the panel's brightness control, see NVRMBacklightHandler
     void publishBacklight();
     struct NvKmsKapiDisplayMode fMode = {};
+    // the mode NVKMS validated for this display, kept when the boot pair takes the firmware's timing instead (applyMode)
+    struct NvKmsKapiDisplayMode fKmsMode = {};
+    bool fHaveKmsMode = false;
     struct NvKmsKapiMemory *fMem = nullptr; struct NvKmsKapiSurface *fSurf = nullptr;
     void *fKva = nullptr; NvU64 fPhys = 0, fSize = 0; NvU32 fPitch = 0, fW = 0, fH = 0;
     NvU64 fScanLogPhys = 0; NvU32 fScanLogW = 0, fScanLogH = 0, fScanLogPitch = 0;  // last nvScanoutInfo answer logged
     IODeviceMemory *fConsMem = nullptr; IOMemoryMap *fConsMap = nullptr;
     void *fConsKva = nullptr; NvU64 fConsPhys = 0, fConsSize = 0; NvU32 fConsPitch = 0;
-    // The centre of the boot image (the logo the firmware screen showed: NullMoth's, or Apple's when it is turned off),
-    // kept so it can be painted again after IOFramebuffer's own boot drawing (IOFramebufferBootInitFB, from postOpen and
-    // doSetup) puts its built-in Apple logo on this surface. Freed once WindowServer owns the screen.
-    uint32_t *fLogoKeep = nullptr; uint32_t fLogoX = 0, fLogoY = 0, fLogoW = 0, fLogoH = 0;
-    // 10-11 logo hunt: the logo area's colours, from the image taken over and from the live screen after open (3 s, 8 s,
-    // 20 s), so the log says whether the white Apple logo arrived before the takeover or was drawn over the moth later.
-    thread_call_t fLogoWatch = nullptr; unsigned fLogoWatchN = 0; unsigned long fLogoLastWhite = ~0ul; uint32_t fLogoWX = 0, fLogoWY = 0, fLogoWW = 0, fLogoWH = 0;
-    void logoStats(const char *when, const volatile uint32_t *base, uint32_t pitchPx, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h);
-    static void logoWatchFire(thread_call_param_t p0, thread_call_param_t);
-    void keepBootLogo(const uint32_t *img, uint32_t iw, uint32_t ih, uint32_t ipitch, uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy);
-    void repaintBootLogo(const char *why);
     NvU64 fVtFbBase = 0, fVtFbSize = 0;
     void *fUserPhys = nullptr;
     IOService *fPciNub = nullptr;
     IOService *pciNub();
     IOMemoryDescriptor *fBarMem = nullptr; IOMemoryMap *fBarMap = nullptr;
     void *fBarKva = nullptr; NvU64 fBarLen = 0;
+    bool fSpareIndex = false;   // kapiInit stopped because this index has no display to drive (expected, not a failure)
     void surveyBar1();
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
@@ -275,6 +273,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvU64 fScanoutBarBytes = 0, fCursorBarBytes = 0;
     unsigned fModeSwitches = 0, fValidateCalls = 0, fValidateOk = 0;
     bool fBootInDT = false;
+    bool fKmsModesLogged = false;   // the per-mode NVKMS listing is printed once, on the first enumeration
     int dtIndex(IODisplayModeID id) const;
     bool edidModeFor(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m);
     unsigned addKmsRefreshModes(unsigned n);
@@ -300,6 +299,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // This instance exists because a display appeared after boot (see gNDpyBoot), and its connect handler has already
     // been fired once -- see connectNotifyFire and enableController.
     bool fHotplugBorn = false, fConnectFired = false;
+    // A different monitor was plugged into this framebuffer's connector (its EDID changed): see adoptSwappedDisplay.
+    bool fEdidSwapped = false;
+    void adoptSwappedDisplay();
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
@@ -312,6 +314,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     volatile unsigned long long fHwVblCalls = 0;
     unsigned fModeSetTicks = 0;
     bool fHwVblWanted = false;
+    unsigned fHwVblTries = 0, fHwVblTickAtTry = 0, fVblTicks = 0;
     static void hwVblIntr(NvU64 param, NvU64 timestamp);
     static void hwVblDeliver(thread_call_param_t p0, thread_call_param_t);
     uint64_t vblPeriodAbs();
@@ -325,9 +328,17 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
+    // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
+    // stuck (kFlipStuckUs since its submit, the head is faulted).
+    uint64_t fFlipSubmitAbs = 0;
+    unsigned fLatchLateLogs = 0;
+    enum { kPriorDone = 0, kPriorLate = 1, kPriorStuck = 2 };
+    uint64_t flipWaitUs();
+    int priorFlipState();
+    void publishFlipWait();
     unsigned fRejected = 0;     // commits NVKMS refused on this head, for NVRMRejectedCommits
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false);
+                        bool bootstrap = false, bool cursorOnly = false, bool frame = false);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -368,8 +379,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
             FBLOG("kapi event type %d (display change)", (int)event->type);
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
-            && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX)
+            && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX) {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
+            flipWake(event->u.flipOccurred.head);
+        }
         // A display connected (or a connector changed) after boot: look for it off this context, after a short
         // settle (EDID reads follow the hot-plug interrupt).
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
@@ -377,28 +390,17 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     }
     static void hotplugKick();
     static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
+    static void flipWake(unsigned head);
+    bool waitFlipDone(uint64_t limitUs);
+    void flipFaultLog(const char *why);
     bool kapiInit();
     bool applyMode();
     void hudDraw();
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
-    // Setting IOFBNeedsRefresh false in open() did not hold - by the time WindowServer
-    // read it ("device_preserves_framebuffer: needs_refresh = YES", 0.3 s later) it was Yes again and WindowServer drew
-    // the white Apple logo over the NullMoth one. While the boot image is held, every write of Yes is turned into No here,
-    // where all of IORegistryEntry's setProperty forms end up.
-    using IOFramebuffer::setProperty;
-    bool setProperty(const OSSymbol *key, OSObject *value) override {
-        if (fLogoKeep && key && value == kOSBooleanTrue && key->isEqualTo(kIOFBNeedsRefreshKey)) {
-            if (!fRefreshHeld++) FBLOG("boot screen: IOFBNeedsRefresh = Yes held at No (the boot image is on screen)");
-            value = kOSBooleanFalse;
-        }
-        return IOFramebuffer::setProperty(key, value);
-    }
-    unsigned fRefreshHeld = 0;
     void free() override;
     IOReturn enableController() override;
-    IOReturn open() override;
     const char *getPixelFormats() override { return kPixelFormats; }
     // macOS builds its mode list from getDisplayModes BEFORE it calls setDetailedTimings, and never re-reads it: a
     // mode added only in setDetailedTimings never reached WindowServer (36 added, 0 shown). So the
@@ -542,7 +544,13 @@ public:
                   (unsigned long)v.v_width, (unsigned long)v.v_height, (unsigned long)v.v_rowBytes, (unsigned)i);
             return this;
         }
-        IOLog("NVRMFB: driver off - the firmware framebuffer is not on this card, not starting\n");
+        // the addresses, so a screen that stays dark with the driver off can be traced: macOS can move the card's VRAM
+        // window after the firmware drew into it (10-17: the firmware's window was gone on a Resizable BAR card)
+        IOLog("NVRMFB: driver off - the firmware framebuffer 0x%llx (+%llu) is not in this card's windows, not starting\n", base, bytes);
+        for (IOItemCount i = 0; i < provider->getDeviceMemoryCount(); i++)
+            if (IOMemoryDescriptor *m = provider->getDeviceMemoryWithIndex(i))
+                IOLog("NVRMFB:   window %u at 0x%llx (%llu B)\n", (unsigned)i,
+                      (unsigned long long)m->getPhysicalSegment(0, 0, kIOMemoryMapperNone), (unsigned long long)m->getLength());
         return NULL;
     }
     void free() override { OSSafeReleaseNULL(fAp); IOFramebuffer::free(); }
@@ -742,6 +750,9 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (getProvider()) getProvider()->setProperty("connected-displays", (unsigned long long)gNDpy, 32);
         FBLOG("ENUMERATED: %d connected display(s) of %u handle(s), %u heads available",
               gNDpy, n, fNumHeads);
+        // NVKMS answered and nothing is plugged into this card (its displays are on another GPU): the driver is up as
+        // far as it will go, so this start counts as good for the boot guard (nvrm_off.h)
+        if (n > 0 && gNDpy == 0) fbGuardCleared("NVKMS lists this card's connectors and none has a display");
     }
 
     if (gBootHead == -2) {
@@ -799,6 +810,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
     if (gNDpyBoot < 0) gNDpyBoot = gNDpy;
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
         FBLOG("index %u: only %d display(s) connected -- nothing to drive, not starting", fIndex, gNDpy);
+        fSpareIndex = gNDpy > 0;
         return false;
     }
     {
@@ -867,7 +879,22 @@ bool NVRMNVDAFramebuffer::kapiInit()
     }
     if (!have) { FBLOG("no valid mode"); return false; }
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
+    fKmsMode = fMode; fHaveKmsMode = true;
     if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
+        // the fallback for a refused firmware timing must be the same raster (it scans out the same surface): the
+        // validated mode at the boot size whose refresh is closest to the firmware's
+        bool same = false; NvU32 bestGap = 0;
+        for (NvU32 i = 0; i < 256; i++) {
+            struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+            int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
+            if (r < 0) break;
+            if (r == 0 || !valid || m.timings.hVisible != gBootMode.timings.hVisible ||
+                m.timings.vVisible != gBootMode.timings.vVisible) continue;
+            const NvU32 gap = m.timings.refreshRate > gBootMode.timings.refreshRate ?
+                m.timings.refreshRate - gBootMode.timings.refreshRate : gBootMode.timings.refreshRate - m.timings.refreshRate;
+            if (!same || gap < bestGap) { fKmsMode = m; bestGap = gap; same = true; }
+        }
+        fHaveKmsMode = same;
         fMode = gBootMode;
         fBootConsole = true;
         FBLOG("boot pair: display 0x%x keeps the firmware's mode %ux%u @%u on head %u", fDisplay,
@@ -1071,8 +1098,10 @@ bool NVRMNVDAFramebuffer::kapiInit()
                                                         (IOByteCount)fConsSize, kIODirectionNone);
             }
         }
-        if (!cm) cm = IOMemoryDescriptor::withAddressRange(fConsPhys, (IOByteCount)fConsSize,
-                                                          kIODirectionNone | kIOMemoryMapperNone, NULL);
+        // A console outside this card's windows belongs to another GPU (the Intel GPU on a laptop): it is not mapped,
+        // so nothing here reads or writes that GPU's memory.
+        if (!cm) FBLOG("console probe: 0x%llx (+%llu) is not in this card's windows (another GPU's console) - not mapped",
+                       fConsPhys, fConsSize);
         fConsMem = (IODeviceMemory *)cm;
         if (fConsMem) { fConsMap = fConsMem->map(kIOMapInhibitCache); if (fConsMap) fConsKva = (void *)fConsMap->getVirtualAddress(); }
     }
@@ -1111,7 +1140,6 @@ bool NVRMNVDAFramebuffer::kapiInit()
                 for (uint32_t x = dx + cw; x < pitchPx; x++) row[x] = bg;
             }
             painted = true;
-            keepBootLogo((const uint32_t *)img, dims[0], dims[1], dims[2], dx, dy, sx, sy);
             FBLOG("boot screen: head 0 painted the %ux%u boot image (pitch %u) centred on %ux%u", dims[0], dims[1], dims[2], fW, fH);
         } else {
             FBLOG("boot screen: NVRM had none (0x%x, provider NVRM %s) — black takeover", r, rm ? "found" : "NOT found");
@@ -1123,102 +1151,6 @@ bool NVRMNVDAFramebuffer::kapiInit()
     return true;
 }
 
-void NVRMNVDAFramebuffer::logoStats(const char *when, const volatile uint32_t *base, uint32_t pitchPx, uint32_t x0,
-                                    uint32_t y0, uint32_t w, uint32_t h)
-{
-    // white = all three channels >= 0xE0; colour = any channel differs from the corner by > 0x20 and not white
-    if (!base || !w || !h) return;
-    const uint32_t bg = base[(size_t)y0 * pitchPx + x0] & 0xffffff;
-    unsigned long white = 0, colour = 0, n = 0; unsigned long long sr = 0, sg = 0, sb = 0;
-    for (uint32_t y = 0; y < h; y += 2) for (uint32_t x = 0; x < w; x += 2) {
-        const uint32_t v = base[(size_t)(y0 + y) * pitchPx + x0 + x] & 0xffffff;
-        const uint32_t r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, b = v & 0xff;
-        n++; sr += r; sg += g; sb += b;
-        if (r >= 0xE0 && g >= 0xE0 && b >= 0xE0) white++;
-        else { int dr = (int)r - (int)((bg >> 16) & 0xff), dg = (int)g - (int)((bg >> 8) & 0xff), db = (int)b - (int)(bg & 0xff);
-               if (dr > 0x20 || dr < -0x20 || dg > 0x20 || dg < -0x20 || db > 0x20 || db < -0x20) colour++; }
-    }
-    FBLOG("logo area %s: %ux%u at %u,%u bg 0x%06x | white %lu colour %lu of %lu samples | mean rgb %llu,%llu,%llu",
-          when, w, h, x0, y0, bg, white, colour, n, n ? sr / n : 0, n ? sg / n : 0, n ? sb / n : 0);
-}
-void NVRMNVDAFramebuffer::logoWatchFire(thread_call_param_t p0, thread_call_param_t)
-{
-    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
-    NVRMCallReference callReference(me);
-    if (OSAddAtomic(0, &me->fStopping) || !me->fKva || !me->fPitch) return;
-    // 25 samples 200 ms apart (0.2-5 s after open), each logged only when the logo area changed, then 8 s and 20 s
-    const unsigned n = me->fLogoWatchN;
-    const unsigned ms = n < 25 ? (n + 1) * 200 : (n == 25 ? 8000 : 20000);
-    const volatile uint32_t *base = (const volatile uint32_t *)me->fKva; const uint32_t pp = me->fPitch / 4;
-    unsigned long white = 0;
-    for (uint32_t y = 0; y < me->fLogoWH; y += 2) for (uint32_t x = 0; x < me->fLogoWW; x += 2) {
-        const uint32_t v = base[(size_t)(me->fLogoWY + y) * pp + me->fLogoWX + x];
-        if ((v & 0xE0E0E0) == 0xE0E0E0) white++;
-    }
-    if (n == 0 || white != me->fLogoLastWhite || n >= 25) {
-        char when[40]; snprintf(when, sizeof when, "live %u ms after open", ms);
-        me->logoStats(when, base, pp, me->fLogoWX, me->fLogoWY, me->fLogoWW, me->fLogoWH);
-    }
-    me->fLogoLastWhite = white;
-    if (++me->fLogoWatchN >= 27) return;
-    const unsigned next = me->fLogoWatchN < 25 ? 200 : (me->fLogoWatchN == 25 ? 3000 : 12000);
-    uint64_t d; clock_interval_to_deadline(next, kMillisecondScale, &d);
-    me->scheduleCall(me->fLogoWatch, d);
-}
-void NVRMNVDAFramebuffer::keepBootLogo(const uint32_t *img, uint32_t iw, uint32_t ih, uint32_t ipitch,
-                                       uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy)
-{
-    // the middle of the boot image, at most 512x512: every boot logo (Apple's 84x103/168x206, NullMoth's 144x180/288x360)
-    const uint32_t cw = iw < fW ? iw : fW, ch = ih < fH ? ih : fH;
-    const uint32_t w = cw < 512 ? cw : 512, h = ch < 512 ? ch : 512;
-    if (!w || !h) return;
-    uint32_t *keep = IONew(uint32_t, (size_t)w * h);
-    if (!keep) return;
-    const uint32_t ox = (cw - w) / 2, oy = (ch - h) / 2;
-    for (uint32_t y = 0; y < h; y++) {
-        const uint32_t *srow = (const uint32_t *)((const uint8_t *)img + (NvU64)(sy + oy + y) * ipitch) + sx + ox;
-        for (uint32_t x = 0; x < w; x++) keep[(size_t)y * w + x] = srow[x];
-    }
-    if (fLogoKeep) IODelete(fLogoKeep, uint32_t, (size_t)fLogoW * fLogoH);
-    fLogoKeep = keep; fLogoW = w; fLogoH = h; fLogoX = dx + ox; fLogoY = dy + oy;
-    fLogoWX = fLogoX; fLogoWY = fLogoY; fLogoWW = w; fLogoWH = h;
-    logoStats("taken over (the screen at the driver's takeover)", keep, w, 0, 0, w, h);
-}
-void NVRMNVDAFramebuffer::repaintBootLogo(const char *why)
-{
-    if (!fLogoKeep || !fKva || !fPitch) return;
-    volatile uint32_t *px = (volatile uint32_t *)fKva;
-    const uint32_t pitchPx = fPitch / 4;
-    for (uint32_t y = 0; y < fLogoH; y++) {
-        if ((NvU64)(fLogoY + y + 1) * fPitch > fSize) break;
-        volatile uint32_t *row = px + (NvU64)(fLogoY + y) * pitchPx + fLogoX;
-        for (uint32_t x = 0; x < fLogoW; x++) row[x] = fLogoKeep[(size_t)y * fLogoW + x];
-    }
-    FBLOG("boot screen: logo %ux%u repainted at %u,%u after %s", fLogoW, fLogoH, fLogoX, fLogoY, why);
-}
-IOReturn NVRMNVDAFramebuffer::open()
-{
-    // postOpen reads IOFBNeedsRefresh: false makes needsInit 2, and initFB then leaves the screen alone instead of
-    // clearing it and drawing IOFramebuffer's built-in Apple logo (and arming kPERefreshBootGraphics). The boot screen
-    // already painted, logo included, stays. A repaint after open() alone lost: the screen still turned white.
-    if (fLogoKeep) setProperty(kIOFBNeedsRefreshKey, false);
-    IOReturn r = super::open();   // runs postOpen -> initFB
-    repaintBootLogo("IOFramebuffer::open");
-    if (fKva && fPitch && fLogoWW) {
-        logoStats("live right after open", (const volatile uint32_t *)fKva, fPitch / 4, fLogoWX, fLogoWY, fLogoWW, fLogoWH);
-        if (!fLogoWatch) fLogoWatch = thread_call_allocate(logoWatchFire, this);
-        if (fLogoWatch && !fLogoWatchN) { uint64_t d; clock_interval_to_deadline(200, kMillisecondScale, &d); scheduleCall(fLogoWatch, d); }
-    }
-    // IOFramebuffer left IOFBNeedsRefresh = Yes after open, WindowServer read it 0.3 s later
-    // ("device_preserves_framebuffer: needs_refresh = YES") and drew its own boot screen - the white Apple logo over the
-    // NullMoth one. The screen does hold the boot image, so say so again for WindowServer.
-    if (fLogoKeep) {
-        FBLOG("boot screen: IOFBNeedsRefresh after open = %s; set to false (the boot image is on screen)",
-              getProperty(kIOFBNeedsRefreshKey) == kOSBooleanTrue ? "Yes" : "No");
-        setProperty(kIOFBNeedsRefreshKey, false);
-    }
-    return r;
-}
 
 static NVRMNVDAFramebuffer *gFB = nullptr;
 // Every started framebuffer, so hot-plug can find the one driving a display that went away and came back.
@@ -1245,6 +1177,37 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     FBLOG("fb%u -> connect interrupt (the framework's registered handler)", me->fIndex);
     me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
 }
+// A different monitor on this framebuffer's connector: take its EDID (what getDDCBlock hands macOS), its physical size,
+// its display-audio ELD, and the scaler/raster ceilings its own mode list allows. The scanout allocation made at start
+// is kept: it backs the surface WindowServer is drawing into, and it cannot be replaced under it. A new monitor whose
+// largest raster needs more than that allocation is offered what fits (the mode check refuses the rest as larger than
+// the scanout allocation) and gets its full size at the next start; the log says so.
+void NVRMNVDAFramebuffer::adoptSwappedDisplay()
+{
+    if (fIndex >= (unsigned)gNDpy) return;
+    const struct nvrm_dpy_rec *r = &gDpy[fIndex];
+    fEdidSize = (NvU16)(r->edidSize > sizeof fEdid ? sizeof fEdid : r->edidSize);
+    nvu_copy(fEdid, r->edid, fEdidSize);
+    nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
+    if (!fInternal && fEdidSize >= 128) {
+        uint8_t eld[NVRM_ELD_MAX];
+        size_t eldn = nvrm_build_eld(fEdid, fEdidSize, NVRM_ELD_CONN_HDMI, eld);
+        if (eldn) { if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); } }
+        else removeProperty("nvda-eld");
+    }
+    const NvU64 keepAlloc = fAllocSize;
+    const NvU32 oldW = fScalerMaxW, oldH = fScalerMaxH;
+    computeScanoutCaps(fPitchAlign);
+    const bool short_ = fAllocSize > keepAlloc;
+    fAllocSize = keepAlloc;
+    // ceilings past the allocation would let a desktop scan out beyond the end of its memory: keep the ones that fit
+    if (short_) { fScalerMaxW = oldW; fScalerMaxH = oldH; fRasterMaxW = oldW; }
+    fEdidHits = 0;
+    FBLOG("fb%u: adopted the new monitor's EDID (%u B, panel %ux%u mm); ceilings %ux%u -> %ux%u%s", fIndex,
+          (unsigned)fEdidSize, (unsigned)fEdidMmW, (unsigned)fEdidMmH, (unsigned)oldW, (unsigned)oldH,
+          (unsigned)fScalerMaxW, (unsigned)fScalerMaxH,
+          short_ ? "; its largest modes need more scanout memory than this start reserved - full size after a restart" : "");
+}
 void NVRMNVDAFramebuffer::hotplugKick()
 {
     if (!gHotplug) return;
@@ -1266,8 +1229,8 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
     for (NvU32 i = 0; i < n; i++) {
-        bool known = false;
-        for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; break; }
+        bool known = false; int kdpy = -1;
+        for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
         bool dynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
         if (known) {
@@ -1276,11 +1239,26 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
             if (!dynOk) continue;
+            // NVKMS names a display by its connector, so a DIFFERENT monitor plugged into the same port comes back as
+            // the same handle. Its EDID is what tells them apart: the old EDID stayed published, and macOS kept the
+            // previous monitor's name, size and modes (a new monitor still listed as the one it replaced).
+            bool swapped = false;
+            if (dd->connected && kdpy >= 0 && dd->edid.bufferSize >= 128) {
+                const NvU32 sz = dd->edid.bufferSize > sizeof gDpy[kdpy].edid ? (NvU32)sizeof gDpy[kdpy].edid : dd->edid.bufferSize;
+                if (sz != gDpy[kdpy].edidSize || memcmp(gDpy[kdpy].edid, dd->edid.buffer, sz) != 0) {
+                    nvu_copy(gDpy[kdpy].edid, dd->edid.buffer, sz); gDpy[kdpy].edidSize = sz;
+                    swapped = true;
+                    FBLOG("hot-plug: display 0x%x has a different monitor now (EDID %u B, maker %02x%02x product %02x%02x)",
+                          handles[i], (unsigned)sz, dd->edid.buffer[8], dd->edid.buffer[9], dd->edid.buffer[11], dd->edid.buffer[10]);
+                }
+            }
             for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
                 NVRMNVDAFramebuffer *fb = gFBs[f];
                 if (!fb || fb->fDisplay != handles[i]) continue;
                 if (!dd->connected) { if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex); fb->fDpyLost = true; }
-                else if (fb->fDpyLost && nrelight < sizeof relight / sizeof relight[0]) { fb->fDpyLost = false; fb->retain(); relight[nrelight++] = fb; }
+                else if ((fb->fDpyLost || swapped) && nrelight < sizeof relight / sizeof relight[0]) {
+                    fb->fDpyLost = false; if (swapped) fb->fEdidSwapped = true; fb->retain(); relight[nrelight++] = fb;
+                }
             }
             continue;
         }
@@ -1303,6 +1281,15 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
+        if (fb->fEdidSwapped && !OSAddAtomic(0, &fb->fStopping)) {
+            fb->fEdidSwapped = false;
+            fb->adoptSwappedDisplay();
+            // the framework's connect-change path re-reads the EDID (getDDCBlock), the modes and the display's name,
+            // as it does when a monitor is plugged into a real Mac; the head is lit first so it re-probes a live display
+            if (!gConnectNotify) gConnectNotify = thread_call_allocate(connectNotifyFire, nullptr);
+            uint64_t d; clock_interval_to_deadline(500, kMillisecondScale, &d);
+            if (gConnectNotify) thread_call_enter1_delayed(gConnectNotify, fb, d);
+        }
         fb->release();
     }
     if (!added) return;
@@ -1353,15 +1340,132 @@ static IORecursiveLock *startLock()
     }
     return gL;
 }
+// Waiting for a flip to complete. Polling NVKMS's pending flag with IOSleep(1) overslept each check by a millisecond or
+// more, and a frame went through two such waits: harmless in a 16.7 ms frame, but at 144 Hz (6.9 ms) the flip landed a
+// vblank late and the desktop ran near half the panel rate while the hardware cursor stayed smooth (1401 "Record
+// flicker" on a 143 Hz panel: 56 flips/s median; 540 Hz: 192/s). The flip-occurred event wakes the waiter, and the
+// pending flag (still the truth) is re-read at least every 250 us. The bound is the caller's, in microseconds: the
+// frame path passes one refresh period and a quarter (flipWaitUs), the old 100 ms is kept only as the stuck limit.
+static IOLock *sFlipWaitLock;
+static volatile SInt32 sFlipWakeEv[8];
+void NVRMNVDAFramebuffer::flipWake(unsigned head)
+{
+    if (head < 8 && sFlipWaitLock) IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
+}
+bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
+{
+    if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
+    uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
+    for (;;) {
+        NvBool pending = NV_TRUE;
+        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
+        if (!pending) return true;
+        uint64_t now = mach_absolute_time();
+        if (now >= end) return false;
+        uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
+        if (next > end) next = end;
+        if (!sFlipWaitLock) { IOSleep(1); continue; }
+        IOLockLock(sFlipWaitLock);
+        IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
+        IOLockUnlock(sFlipWaitLock);
+    }
+}
 // Flip completion-wait controls, surfaced through the debug.nvrmfb_flip_latch* sysctls registered
 // below. gFlipLatch gates the wait (default 1; 0 is a debug bypass that lets a surface retire before
 // its flip latches, i.e. reintroduces the strobe). The counters report the real wait the compositor
 // path takes, which is what an on-machine flicker check reads.
 static int gFlipLatch = 1;
-static int gFlipLatchWaits = 0, gFlipLatchTimeouts = 0, gFlipLatchMaxUs = 0;
+static int gFlipLatchWaits = 0, gFlipLatchTimeouts = 0, gFlipLatchMaxUs = 0, gFlipLatchLate = 0;
+// A flip still pending this long after its submit is a display that is not flipping (the head is faulted, as before).
+// Inside it, a pending flip is only late: the frame path skips one present and the mode-set path waits on.
+static const uint64_t kFlipStuckUs = 100000;
+// What the compositor's presents did over a window of activity, one line per head, so a "windows stutter, cursor smooth"
+// report is decided by the log alone: flips per second against the panel rate, how many missed their vblank, how many
+// presents were skipped for a flip still on its way, and the longest completion wait. A window opens at the first
+// frame-path present after the previous one closed and closes after 10 s; quiet windows (an idle desktop) print
+// nothing, and the number of lines is capped so a long session cannot flood the log. A pause of more than two seconds
+// between presents starts the window over: five seconds of smooth dragging, a minute of nothing, then one present would
+// otherwise close as "13 flips/s" and read as starvation.
+struct NVPresentWindow { uint64_t t0Abs, lastAbs; uint32_t flips, over, late, maxUs; };
+static NVPresentWindow gPresentWin[8];
+static uint32_t gPresentLines[8];
+static const uint64_t kPresentWindowNs = 10000000000ull;
+static const uint64_t kPresentIdleNs = 2000000000ull;
+static char gPresentMsg[240];
+// True when the window closed with a line to print, in gPresentMsg. The caller prints it with IOLog and kprintf only: FBLOG's
+// trace allocates, and this runs on the present path under the display gate.
+#define PRESENT_STATS_LOG() do { IOLog("NVRM-fb: %s\n", gPresentMsg); kprintf("NVRM-fb: %s\n", gPresentMsg); } while (0)
+static bool presentStatsNote(unsigned head, uint64_t boundUs, bool flipped, bool over, bool late, uint32_t waitUs)
+{
+    if (head >= 8) return false;
+    NVPresentWindow &w = gPresentWin[head];
+    const uint64_t now = mach_absolute_time();
+    if (w.lastAbs) {
+        uint64_t idle = 0; absolutetime_to_nanoseconds(now - w.lastAbs, &idle);
+        if (idle > kPresentIdleNs) w = NVPresentWindow();
+    }
+    w.lastAbs = now;
+    if (!w.t0Abs) w.t0Abs = now;
+    if (flipped) w.flips++;
+    if (over) w.over++;
+    if (late) w.late++;
+    if (waitUs > w.maxUs) w.maxUs = waitUs;
+    uint64_t ns = 0; absolutetime_to_nanoseconds(now - w.t0Abs, &ns);
+    if (ns < kPresentWindowNs) return false;
+    const uint32_t perSec = (uint32_t)(((uint64_t)w.flips * 1000000000ull + ns / 2) / ns);
+    // flipWaitUs() is one refresh period and a quarter, so the period is four fifths of the bound
+    const uint64_t periodUs = boundUs * 4 / 5;
+    const uint32_t panelHz = periodUs ? (uint32_t)((1000000ull + periodUs / 2) / periodUs) : 0;
+    // 60 flips in a window is an animating desktop, whatever its rate; a few per window is the clock or a cursor blink
+    const bool busy = w.flips >= 60 || w.over || w.late;
+    const bool print = busy && (gPresentLines[head] < 40 || (gPresentLines[head] % 10) == 0);
+    if (print)
+        snprintf(gPresentMsg, sizeof gPresentMsg, "present stats head %u: %u flips in %llu ms (%u/s, panel %u Hz), %u not on the "
+                 "panel within a refresh period and a quarter, %u presents skipped for a flip still pending, longest completion wait %u us",
+                 head, w.flips, (unsigned long long)(ns / 1000000ull), perSec, panelHz, w.over, w.late, w.maxUs);
+    if (busy) gPresentLines[head]++;
+    w = NVPresentWindow();
+    return print;
+}
+// How long a committed flip can take to reach the panel: it latches at the next vblank, so one refresh period from the
+// mode's raster and pixel clock, plus a quarter period for the completion write and the 250 us re-read. A constant
+// 100 ms here held WindowServer's frame for six 60 Hz periods, or sixteen at 165 Hz, whenever a flip ran late.
+// The period comes from the raster directly: vblPeriodAbs floors it at 2 ms for the fallback timer, which would make a
+// 540 Hz panel's bound eleven periods. Under 1 ms (over 1000 Hz) or over 50 ms the timings are not trusted.
+uint64_t NVRMNVDAFramebuffer::flipWaitUs()
+{
+    const struct NvKmsKapiDisplayModeTimings &t = fMode.timings;
+    uint64_t ns = 0;
+    if (t.pixelClockHz && t.hTotal && t.vTotal) ns = (uint64_t)t.hTotal * t.vTotal * 1000000000ull / t.pixelClockHz;
+    if (ns < 1000000ull || ns > 50000000ull) absolutetime_to_nanoseconds(vblPeriodAbs(), &ns);
+    return (ns + ns / 4) / 1000;
+}
+// The flip before this one has to be on the panel before the surface it replaced may go away. One period covers a
+// flip in flight; past kFlipStuckUs since its submit the display is stuck.
+int NVRMNVDAFramebuffer::priorFlipState()
+{
+    if (!fSubmissionSeen) return kPriorDone;
+    if (waitFlipDone(flipWaitUs())) return kPriorDone;
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - fFlipSubmitAbs, &ns);
+    if (ns / 1000 >= kFlipStuckUs) return kPriorStuck;
+    return kPriorLate;
+}
+// The accelerator bounds its own wait for a flip in flight by the same period (NVAccel reads this when it has to wait).
+void NVRMNVDAFramebuffer::publishFlipWait()
+{
+    setProperty("NVRMFlipWaitUs", (unsigned long long)flipWaitUs(), 64);
+}
+// The line a head fault leaves in the kernel log: how long the flip had been pending and what the latch counters read,
+// so a log that ends in a display failure says whether the head faulted and after how long.
+void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
+{
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - fFlipSubmitAbs, &ns);
+    FBLOG("presentation blocked: %s on head %u (%llu us since its submit; latch waits %d timeouts %d late %d max %d us)",
+          why, fHead, (unsigned long long)(ns / 1000), gFlipLatchWaits, gFlipLatchTimeouts, gFlipLatchLate, gFlipLatchMaxUs);
+}
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly)
+                                            bool cursorOnly, bool frame)
 {
     if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted) return NV_FALSE;
     if (!commit) return fKms->applyModeSetConfig(fDev, cfg, rep, NV_FALSE);
@@ -1372,22 +1476,24 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         return ok && rep->flipResult == NV_KMS_FLIP_RESULT_SUCCESS;
     }
     if (fSubmissionSeen) {
-        // Initial console acceptance is asynchronous. A still-pending prior flip
-        // must receive the same bounded completion wait as a newly committed flip.
-        bool complete = false;
-        for (unsigned i = 0; i < 100; ++i) {
-            NvBool pending = NV_TRUE;
-            if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-            if (!pending) { complete = true; break; }
-            IOSleep(1);
-        }
-        if (!complete) {
-            FBLOG("presentation blocked: prior completion unavailable on head %u", fHead);
+        // Initial console acceptance is asynchronous. A still-pending prior flip gets the same one-period wait as a
+        // newly committed flip. On the frame path a flip that is merely late costs this present (IN_PROGRESS: the
+        // caller keeps the frame on the panel and the next one follows); a mode set waits on until the stuck limit.
+        int prior = priorFlipState();
+        while (prior == kPriorLate && !frame) prior = priorFlipState();
+        if (prior == kPriorStuck) {
+            flipFaultLog("prior completion unavailable");
             fSubmissionFaulted = true; return NV_FALSE;
+        }
+        if (prior == kPriorLate) {
+            OSIncrementAtomic((volatile SInt32 *)&gFlipLatchLate);
+            if (frame && presentStatsNote(fHead, flipWaitUs(), false, false, true, 0)) PRESENT_STATS_LOG();
+            rep->flipResult = NV_KMS_FLIP_RESULT_IN_PROGRESS; return NV_FALSE;
         }
     }
     const bool tracked = cfg->headRequestedConfig[fHead].modeSetConfig.bActive &&
         cfg->headRequestedConfig[fHead].layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface;
+    const uint64_t submit0 = mach_absolute_time();
     const NvBool accepted = fKms->applyModeSetConfig(fDev, cfg, rep, NV_TRUE);
     if (!accepted || rep->flipResult != NV_KMS_FLIP_RESULT_SUCCESS) {
         // A rejected request queued nothing (INVALID_PARAMS fails validation, IN_PROGRESS refuses before queuing), so
@@ -1418,23 +1524,38 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     if (cursorOnly) return NV_TRUE;
     if (!tracked) { fSubmissionSeen = false; return NV_TRUE; }
     fSubmissionSeen = true;
+    fFlipSubmitAbs = submit0;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
     if (bootstrap || !gFlipLatch) return NV_TRUE;
     OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
     const uint64_t latch0 = mach_absolute_time();
-    for (unsigned i = 0; i < 100; ++i) {
-        NvBool pending = NV_TRUE;
-        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-        if (!pending) {
-            const int us = (int)((mach_absolute_time() - latch0) / 1000);
-            if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
+    if (waitFlipDone(flipWaitUs())) {
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &ns);
+        const int us = (int)(ns / 1000);
+        if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
+        if (frame && presentStatsNote(fHead, flipWaitUs(), true, false, false, (uint32_t)us)) PRESENT_STATS_LOG();
+        return NV_TRUE;
+    }
+    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
+    // Past one period the flip is late, not lost, and the wait goes on: until it lands the panel may still scan the
+    // surface it replaces, and the caller completes the transaction (WindowServer then reuses that surface) as soon as
+    // this returns. On the frame path the caller is the accelerator's swap worker, which WindowServer does not wait on
+    // past its own one-period bound. Past the stuck limit both the old front and the submitted surface stay alive until
+    // a proven recovery or reboot.
+    if (frame && (++fLatchLateLogs <= 8 || (fLatchLateLogs % 64) == 0))
+        FBLOG("flip on head %u not on the panel within %llu us (#%u) - waiting for it to land",
+              fHead, (unsigned long long)flipWaitUs(), fLatchLateLogs);
+    for (;;) {
+        if (waitFlipDone(flipWaitUs())) {
+            // a late flip is reported with the whole wait it took, not the period it first missed
+            uint64_t late = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &late);
+            if (frame && presentStatsNote(fHead, flipWaitUs(), true, true, false, (uint32_t)(late / 1000))) PRESENT_STATS_LOG();
             return NV_TRUE;
         }
-        IOSleep(1);
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - submit0, &ns);
+        if (ns / 1000 >= kFlipStuckUs) break;
     }
-    // Keep both the old front and submitted surface alive until a proven recovery/reboot.
-    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
-    FBLOG("presentation blocked: submitted completion unavailable on head %u", fHead);
+    flipFaultLog("submitted completion unavailable");
     fSubmissionFaulted = true; return NV_FALSE;
 }
 
@@ -1444,24 +1565,34 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
     if (!me->fKva) return;
-    volatile uint32_t *px = (volatile uint32_t *)((me->fConsoleAperture && me->fConsKva) ? me->fConsKva : me->fKva);
-    unsigned w = me->fW, h = me->fH, ppr = me->fPitch / 4;
+    // Every read stays inside the mapping it uses: the console window is only as large as the firmware's screen, which
+    // can be smaller than the current mode, and the fixed sample points can lie past a small mode.
+    const bool onCons = me->fConsoleAperture && me->fConsKva;
+    volatile uint32_t *px = (volatile uint32_t *)(onCons ? me->fConsKva : me->fKva);
+    unsigned ppr = me->fPitch / 4;
+    if (!ppr) return;
+    const unsigned rows = (unsigned)((onCons ? me->fConsSize : me->fSize) / me->fPitch);
+    unsigned w = me->fW < ppr ? me->fW : ppr, h = me->fH < rows ? me->fH : rows;
+    auto at = [](volatile uint32_t *b, unsigned pp, unsigned bw, unsigned bh, unsigned x, unsigned y) -> uint32_t {
+        return (x < bw && y < bh) ? b[(size_t)y * pp + x] : 0; };
     uint32_t sum = 0; unsigned notGrey = 0, n = 0;
-    for (unsigned y = 0; y < h; y += 8) for (unsigned x = 0; x < w; x += 8) { uint32_t v = px[y * ppr + x] & 0xffffff; sum = sum * 33 + v; if (v != 0x303030) notGrey++; n++; }
+    for (unsigned y = 0; y < h; y += 8) for (unsigned x = 0; x < w; x += 8) { uint32_t v = px[(size_t)y * ppr + x] & 0xffffff; sum = sum * 33 + v; if (v != 0x303030) notGrey++; n++; }
     FBLOG("sample %u: sum 0x%08x not-grey %u/%u px(100,100)=0x%08x px(960,540)=0x%08x px(1800,1000)=0x%08x modeset %u | phys 0x%llx size %llu pitch %u %ux%u ok %u flip %d | disp 0x%x head %u conn 0x%x heads %u conns %u reflips %u rc %d",
           me->fSamples, sum, notGrey, n,
-          px[100 * ppr + 100], px[540 * ppr + 960], px[1000 * ppr + 1800], me->fModeSet,
+          at(px, ppr, w, h, 100, 100), at(px, ppr, w, h, 960, 540), at(px, ppr, w, h, 1800, 1000), me->fModeSet,
           me->fPhys, me->fSize, me->fPitch, me->fW, me->fH, me->fLastOk, me->fFlipResult,
           me->fDisplay, me->fHead, me->fConnector, me->fNumHeads, me->fNumConnectors,
           me->fReflips, me->fReflipRc);
     FBLOG("  vblreg %u vblcalls %llu", me->fVblReg, me->fVblCalls);
     if (me->fConsKva && me->fConsPitch >= 4) {
         volatile uint32_t *cp = (volatile uint32_t *)me->fConsKva;
-        unsigned cppr = me->fConsPitch / 4; uint32_t csum = 0;
-        for (unsigned y = 0; y < h; y += 8) for (unsigned x = 0; x < w; x += 8) csum = csum * 33 + (cp[y * cppr + x] & 0xffffff);
+        const unsigned cppr = me->fConsPitch / 4, crows = (unsigned)(me->fConsSize / me->fConsPitch);
+        const unsigned cw = me->fW < cppr ? me->fW : cppr, ch = me->fH < crows ? me->fH : crows;
+        uint32_t csum = 0;
+        for (unsigned y = 0; y < ch; y += 8) for (unsigned x = 0; x < cw; x += 8) csum = csum * 33 + (cp[(size_t)y * cppr + x] & 0xffffff);
         FBLOG("  cons@0x%llx: sum 0x%08x px(100,100)=0x%06x px(960,540)=0x%06x px(1800,1000)=0x%06x",
-              me->fConsPhys, csum, cp[100 * cppr + 100] & 0xffffff,
-              cp[540 * cppr + 960] & 0xffffff, cp[1000 * cppr + 1800] & 0xffffff);
+              me->fConsPhys, csum, at(cp, cppr, cw, ch, 100, 100) & 0xffffff,
+              at(cp, cppr, cw, ch, 960, 540) & 0xffffff, at(cp, cppr, cw, ch, 1800, 1000) & 0xffffff);
     }
     me->fSamples++;
     uint64_t deadline; clock_interval_to_deadline(10, kSecondScale, &deadline); me->scheduleCall(me->fSampler, deadline);
@@ -1799,6 +1930,13 @@ uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
     }
     uint64_t abs = 0; nanoseconds_to_absolutetime(ns, &abs); return abs;
 }
+// The hardware vblank registration is retried every kHwVblRetryTicks ticks of the fallback timer (5 s at 60 Hz, 2 s at
+// 144 Hz), a dozen times per mode set; a refusal that holds that long is taken as final and the timer stays the VBL.
+static const unsigned kHwVblRetryTicks = 300, kHwVblMaxTries = 12;
+static bool hwVblRetryDue(unsigned tries, unsigned ticksSinceTry)
+{
+    return tries < kHwVblMaxTries && ticksSinceTry >= kHwVblRetryTicks;
+}
 void NVRMNVDAFramebuffer::hwVblIntr(NvU64 param, NvU64)
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)(uintptr_t)param;
@@ -1827,11 +1965,19 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     // with a non-zero pixel clock, held for ~1 s of ticks, is that condition stated directly.
     if (me->fModeSet && !me->fConsoleAperture && me->fMode.timings.pixelClockHz) { if (me->fModeSetTicks < 1000) me->fModeSetTicks++; }
     else me->fModeSetTicks = 0;
-    if (me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60)) {
-        me->fHwVblWanted = false;
+    // A refused registration is tried again (hwVblRetryDue): one try at 60 mode ticks left a display whose head was
+    // still settling on the free-running timer for the whole session, its frames beating against the real scan-out.
+    // A new mode set starts the tries over.
+    me->fVblTicks++;
+    if (me->fModeSetTicks == 0) me->fHwVblTries = 0;
+    if (me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60) &&
+        (me->fHwVblTries == 0 || hwVblRetryDue(me->fHwVblTries, me->fVblTicks - me->fHwVblTickAtTry))) {
+        me->fHwVblTries++; me->fHwVblTickAtTry = me->fVblTicks;
         me->fHwVblCb = me->fKms->registerVblankIntrCallback(me->fDev, me->fHead, hwVblIntr, (NvU64)(uintptr_t)me);
-        FBLOG("hw vblank on head %u: %s after %d latched flips, %u mode ticks", me->fHead, me->fHwVblCb ? "REGISTERED" : "REFUSED by NVKMS - timer stays",
-              (int)sFlipLatched[me->fHead], me->fModeSetTicks);
+        if (me->fHwVblCb) me->fHwVblWanted = false;
+        FBLOG("hw vblank on head %u: %s after %d latched flips, %u mode ticks (try %u)", me->fHead,
+              me->fHwVblCb ? "REGISTERED" : hwVblRetryDue(me->fHwVblTries, kHwVblRetryTicks) ? "REFUSED by NVKMS - timer stays, trying again" : "REFUSED by NVKMS - timer stays",
+              (int)sFlipLatched[me->fHead], me->fModeSetTicks, me->fHwVblTries);
     }
     {   uint64_t nowv = 0; clock_get_uptime(&nowv); const uint64_t per = me->vblPeriodAbs();
         const bool hwLive = me->fHwVblLast && nowv - me->fHwVblLast < 2 * per;
@@ -1917,6 +2063,38 @@ bool NVRMNVDAFramebuffer::applyMode()
     lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     nvrmUnownedHeadsOff(cfg);
     NvBool ok = submitConfig(cfg, rep, NV_TRUE, true);
+    // A refused first mode set leaves WindowServer asserting in CGXMappedDisplayStart and crash-looping (an RTX 3060 at
+    // 1920x1080, 2.1.0 and 2.2.0). First retry with the mode NVKMS validated for the same raster, when it differs from the
+    // firmware's timing (it scans out the same surface).
+    if (!ok && fHaveKmsMode && memcmp(&fMode, &fKmsMode, sizeof fMode) != 0 &&
+        fKmsMode.timings.hVisible == fRasterW && fKmsMode.timings.vVisible == fRasterH) {
+        FBLOG("applyMode: firmware timing pclk %u %ux%u refused; retrying with NVKMS's validated mode pclk %u %ux%u @%u",
+              fMode.timings.pixelClockHz, fMode.timings.hTotal, fMode.timings.vTotal, fKmsMode.timings.pixelClockHz,
+              fKmsMode.timings.hTotal, fKmsMode.timings.vTotal, fKmsMode.timings.refreshRate);
+        hr->modeSetConfig.mode = fKmsMode;
+        nvu_zero(rep, sizeof *rep);
+        ok = submitConfig(cfg, rep, NV_TRUE, true);
+        if (ok) fMode = fKmsMode;
+    }
+    // Then keep the mode the firmware is already scanning out and only put our surface on the head: a flip, no mode set.
+    // KAPI takes the flip path only when no head in the request changes mode, activity or displays, so the request holds
+    // this head alone. The 2.2.0 log of that RTX 3060 shows the validated mode equals the firmware's, so the refusal is
+    // not the timing; NVKMS now logs its reason codes ("[kapi] set mode refused").
+    if (!ok) {
+        nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
+        cfg->headsMask = 1u << fHead;
+        nvrmHeadConfigBaseline(hr, fGammaOn ? fGamma : NULL);
+        hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = fDisplay;
+        hr->modeSetConfig.mode = fMode;
+        lr->config.surface = fSurf; lr->config.srcWidth = fW; lr->config.srcHeight = fH;
+        lr->config.dstWidth = fRasterW; lr->config.dstHeight = fRasterH;
+        lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
+        lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged =
+            lr->flags.dstWHChanged = NV_TRUE;
+        ok = submitConfig(cfg, rep, NV_TRUE, true);
+        FBLOG("applyMode: mode set refused; flip onto the firmware's running %ux%u mode on head %u -> %u (flipResult %d)",
+              fRasterW, fRasterH, fHead, (unsigned)ok, (int)rep->flipResult);
+    }
     fLastOk = (unsigned)ok; fFlipResult = (int)rep->flipResult;
     FBLOG("applyModeSetConfig -> %u (flipResult %d)", ok, (int)rep->flipResult);
     if (ok && fKms->framebufferConsoleDisabled) {
@@ -1925,6 +2103,8 @@ bool NVRMNVDAFramebuffer::applyMode()
     }
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     fModeSet = ok;
+    publishFlipWait();
+    fHwVblTries = 0;
     return ok;
 }
 
@@ -1978,6 +2158,22 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
           (unsigned long long)(nvrmVramBudget(fBarLen) >> 20));
     if (fIndex == 0 && gFB != this) { retain(); gFB = this; }
     if (fIndex == 0 && !gHotplug) gHotplug = thread_call_allocate(hotplugFire, nullptr);
+    // WhateverGreen (with Lilu) replaces IOFramebuffer::initFB. Unless boot-arg gfxrst=4 is set, the first initFB of any
+    // framebuffer copies the boot console from the address WhateverGreen saved at boot. macOS frees that mapping when
+    // the console moves (to a framebuffer, or to a new PCI window), and the copy then faults: a kernel panic in
+    // WindowServer's IOFramebuffer::open (postOpen) as this display opens. This driver cannot repair the saved address;
+    // gfxrst=4 turns the copy off, and this driver draws its own takeover screen.
+    // Its class is looked up rather than its service: a Lilu plugin's service is started but never registered, so a
+    // service match does not find it.
+    if (fIndex == 0) {
+        const OSSymbol *name = OSSymbol::withCStringNoCopy("WhateverGreen");
+        const bool weg = name && OSMetaClass::getMetaClassWithName(name);
+        OSSafeReleaseNULL(name);
+        int gfxrst = -1;
+        if (weg && !(PE_parse_boot_argn("gfxrst", &gfxrst, sizeof gfxrst) && gfxrst == 4))
+            FBLOG("WhateverGreen is loaded without boot-arg gfxrst=4: its boot screen copy can read freed memory when "
+                  "this display opens (kernel panic in IOFramebuffer::postOpen). Add gfxrst=4 to boot-args.");
+    }
     if (fIndex < sizeof gFBs / sizeof gFBs[0]) {
         IORecursiveLock *sl = startLock();
         if (sl) IORecursiveLockLock(sl);
@@ -2001,8 +2197,13 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
-        FBLOG("kapiInit failed -- refusing to start. super::start() was NOT called, so there is "
-              "nothing half-registered to unwind and the machine stays up without a display.");
+        // nvfbheads=4 starts four framebuffer instances; the ones past the connected displays have nothing to drive and
+        // stop here on every healthy boot. Say so, so a log with one lit head is not read as a refused framebuffer.
+        if (fSpareIndex)
+            FBLOG("index %u: spare framebuffer instance (a display-less index) -- not started, expected", fIndex);
+        else
+            FBLOG("kapiInit failed -- refusing to start. super::start() was NOT called, so there is "
+                  "nothing half-registered to unwind and the machine stays up without a display.");
         return false;
     }
     setName("NVRMFramebuffer");
@@ -2046,6 +2247,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     registerPowerDriver(this, kFBPowerStates, 2);
     FBLOG("registerPowerDriver(2 states) done");
     FBLOG("started on %s", provider->getName());
+    fbGuardCleared("the framebuffer has its scanout memory and a display mode");
     return true;
 }
 void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)
@@ -2077,7 +2279,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fLogoWatch};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -2087,6 +2289,11 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
             IOSleep(1);
         }
         *calls[i] = nullptr;
+    }
+    // vblFire retries a refused registration; one that passed its stopping check before fStopping was set can register
+    // after the unregister above. The timer is drained now, so a callback registered that way is removed here.
+    if (fHwVblCb && fKms && fDev) {
+        fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
     if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
     if (fGamma) { IOFree(fGamma, sizeof *fGamma); fGamma = nullptr; fGammaOn = false; }
@@ -2128,7 +2335,7 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 void NVRMNVDAFramebuffer::free()
 {
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
-    if (fLogoKeep) { IODelete(fLogoKeep, uint32_t, (size_t)fLogoW * fLogoH); fLogoKeep = nullptr; }
+    fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     super::free();
 }
 
@@ -2260,12 +2467,18 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, pref = NV_FALSE;
         int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &pref);
         if (r < 0) break;
-        if (r == 0 || !valid) continue;
         const struct NvKmsKapiDisplayModeTimings &k = m.timings;
+        const NvU64 tot = (NvU64)k.hTotal * k.vTotal;
+        const NvU32 hz = tot ? (NvU32)((k.pixelClockHz + tot / 2) / tot) : 0;
+        // The first pass (before macOS proposes anything) lists every mode NVKMS enumerated and what became of it, so
+        // a report with one refresh rate shows whether the panel's EDID offered another or NVKMS dropped it.
+        if (!fromMac && !fKmsModesLogged)
+            FBLOG("fb%u NVKMS mode %u: %ux%u @%u Hz pclk %u valid %u preferred %u%s%s", fIndex, i, k.hVisible, k.vVisible, hz,
+                  k.pixelClockHz, (unsigned)valid, (unsigned)pref, r == 0 ? " (empty slot)" : "",
+                  (k.flags.interlaced || k.flags.doubleScan) ? " interlaced/doublescan" : "");
+        if (r == 0 || !valid) continue;
         if (k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz || k.hTotal <= k.hVisible || k.vTotal <= k.vVisible ||
             k.hSyncStart < k.hVisible || k.hSyncEnd < k.hSyncStart || k.vSyncStart < k.vVisible || k.vSyncEnd < k.vSyncStart) continue;
-        const NvU64 tot = (NvU64)k.hTotal * k.vTotal;
-        const NvU32 hz = (NvU32)((k.pixelClockHz + tot / 2) / tot);
         int tmpl = -1; bool have = false, raster = false;
         for (unsigned j = 0; j < n; j++) {
             const IODetailedTimingInformationV2 &d = fDT[j];
@@ -2293,7 +2506,13 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
             NvU32 pitch = 0;
             if (nvrmCheckedPitch(k.hVisible, fPitchAlign, &pitch) && (NvU64)pitch * k.vVisible <= fMemBytes) raster = true;
         }
-        if (have || !raster) continue;
+        if (have || !raster) {
+            if (!fromMac && !fKmsModesLogged)
+                FBLOG("fb%u NVKMS mode %u: not offered (%s)", fIndex, i, have ? "already listed at this rate"
+                      : !fBootW ? "no boot raster yet" : (!bootRaster && !larger) ? "smaller than the boot raster (desktops that size come from macOS's scaled modes)"
+                      : "does not fit the scanout memory or the scaler");
+            continue;
+        }
         IODetailedTimingInformationV2 b;
         if (tmpl >= 0) b = fDT[tmpl];
         else { nvu_zero(&b, sizeof b); b.horizontalActive = k.hVisible; b.verticalActive = k.vVisible; b.signalConfig = kIODigitalSignal; }
@@ -2321,6 +2540,7 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         FBLOG("fb%u refresh rate from NVKMS: %ux%u @%u Hz (pclk %u) as dt 0x%x", fIndex, k.hVisible, k.vVisible, hz,
               k.pixelClockHz, b.detailedTimingModeID);
     }
+    if (!fromMac) fKmsModesLogged = true;
     setProperty("NVRMRefreshModesAdded", (unsigned long long)added, 32);
     return n;
 }
@@ -2375,6 +2595,8 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     struct NvKmsKapiSurface *old = fSurf;
     fSurf = ns; fFrontSurf = ns; fMode = m; fW = w; fH = h; fPitch = pitch;
     fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
+    publishFlipWait();
+    fHwVblTries = 0;   // a new mode gets its own hardware-vblank tries (fModeSet stays set, so vblFire would not reset them)
     if (old && old != ns) fKms->destroySurface(fDev, old);
     {
         const struct NvKmsKapiDisplayModeTimings &k5t = fMode.timings;
@@ -2699,8 +2921,19 @@ static int gFlipInterval = 1;
 // gFlipLatch and the counters are defined above submitConfig, where the completion wait drives them.
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatch, 0, "1 = a committed flip waits for its completion before a surface retires (0 = debug bypass)");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchWaits, 0, "flips that waited for completion");
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchTimeouts, 0, "flips whose completion never arrived within the wait");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_guard_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, &gGuardCleared, 0, "1 once the boot guard was cleared this boot");
+// Registered here and not with the other counters: those are registered from the first video-memory grant, which a
+// card with no display to light never makes, and the headless clear is exactly the case NVRM has to be able to read.
+static void fbGuardCleared(const char *why)
+{
+    static volatile SInt32 once;
+    if (OSCompareAndSwap(0, 1, &once)) sysctl_register_oid(&sysctl__debug_nvrmfb_guard_cleared);
+    nvrm_guard_display_up(why);
+    gGuardCleared = 1;
+}
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchTimeouts, 0, "flips not on the panel within a refresh period and a quarter of their submit (waited on to the stuck limit)");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchMaxUs, 0, "longest submit-to-completion wait (us)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_late, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchLate, 0, "presents skipped because the previous flip was still on its way to the panel");
 static int gFlipLean = 1;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_lean, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLean, 0, "1 = lean pure flip (surface only)");
 static SInt64 gFlipUsSum, gFlipN, gFlipUsMax;
@@ -2722,6 +2955,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
@@ -2740,9 +2974,22 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
-        FBLOG("nvAllocVram(%llu): REFUSED — BAR1 budget spent (%lld of %llu bytes). "
-              "This is the resizable-BAR ceiling, not a VRAM shortage.",
-              (unsigned long long)want, (long long)before, (unsigned long long)budget);
+        // A full 256 MB window is refused thousands of times in a session (one size, retried every frame: 1,413 lines in
+        // one user log), and each line costs a kernel log write on the path that is already out of room. Log the first
+        // eight, then every 256th with the running count, and say once who holds the window: grants against releases
+        // tell a working set from a leak.
+        static volatile SInt32 refused = 0;
+        const SInt32 nRefused = OSIncrementAtomic(&refused) + 1;
+        if (nRefused <= 8 || (nRefused & 255) == 0)
+            FBLOG("nvAllocVram(%llu): REFUSED (#%d) — BAR1 budget spent (%lld of %llu bytes). "
+                  "This is the resizable-BAR ceiling, not a VRAM shortage.",
+                  (unsigned long long)want, (int)nRefused, (long long)before, (unsigned long long)budget);
+        if (nRefused == 1)
+            FBLOG("BAR1 full: %lld grants (%lld bytes) vs %lld releases (%lld bytes); live %lld, console parks %lld bytes "
+                  "in %d slots, display %lld, budget %lld, BAR1 %llu",
+                  (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
+                  (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
+                  (long long)budget, (unsigned long long)fBarLen);
         return false;
     }
 
@@ -2836,7 +3083,19 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         }
         mem = m; kva = k; phys = p;
     }
-    if (!mem) { OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false; }
+    if (!mem) {
+        OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        // Who holds the window, once per boot: a 256 MB BAR1 that fills up cannot be told apart from a leak by the
+        // failure lines alone; grants against releases can.
+        static volatile SInt32 said = 0;
+        if (OSCompareAndSwap(0, 1, &said))
+            FBLOG("BAR1 full: %lld grants (%lld bytes) vs %lld releases (%lld bytes); live %lld, console parks %lld bytes "
+                  "in %d slots, display %lld, budget %lld, BAR1 %llu",
+                  (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
+                  (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
+                  (long long)budget, (unsigned long long)fBarLen);
+        return false;
+    }
 
     nvu_zero_wide(kva, (size_t)want);
     volatile NvU64 *q = (volatile NvU64 *)kva;
@@ -2942,7 +3201,8 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
         f->flipResult = rc;
-        return ok ? kIOReturnSuccess : kIOReturnIOError;
+        // Busy: the previous flip is still on its way to the panel; the caller keeps its frame and presents the next.
+        return ok ? kIOReturnSuccess : rc == (int)NV_KMS_FLIP_RESULT_IN_PROGRESS ? kIOReturnBusy : kIOReturnIOError;
     }
     if (functionName && functionName->isEqualTo(NVRM_FLIP_FN)) {
         struct NVRMFlipRequest *f = (struct NVRMFlipRequest *)param1;
@@ -2951,7 +3211,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         bool ok = flipToMemory((struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, false, f->allocationCookie);
         f->flipResult = rc;
-        return ok ? kIOReturnSuccess : kIOReturnIOError;
+        return ok ? kIOReturnSuccess : rc == (int)NV_KMS_FLIP_RESULT_IN_PROGRESS ? kIOReturnBusy : kIOReturnIOError;
     }
     const char *name = functionName ? functionName->getCStringNoCopy() : "(null)";
     if (!isAlloc && !isFree)
@@ -3010,6 +3270,18 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         if (slot == 16 || !cacheable) return false;
         NVFlipEntry &entry = fFlipCache[slot];
         if (entry.surf) {
+            // Until the latest flip has landed, the panel may still be scanning the front before it, which is one of
+            // these non-front slots. A late flip costs this present (the caller keeps the frame); a stuck one faults.
+            const int prior = priorFlipState();
+            if (prior != kPriorDone) {
+                if (prior == kPriorStuck) {
+                    flipFaultLog("prior completion unavailable (surface reuse)");
+                    fSubmissionFaulted = true;
+                }
+                if (prior == kPriorLate) OSIncrementAtomic((volatile SInt32 *)&gFlipLatchLate);
+                if (rcOut) *rcOut = prior == kPriorLate ? (int)NV_KMS_FLIP_RESULT_IN_PROGRESS : -1;
+                return false;
+            }
             fKms->destroySurface(fDev, entry.surf);
             if (entry.pin) fKms->freeMemory(fDev, entry.pin);
             entry = {};
@@ -3055,10 +3327,12 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     if (!lean)
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     const uint64_t ft0 = mach_absolute_time();
-    NvBool ok = submitConfig(cfg, rep, NV_TRUE);
+    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true);
     if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
         OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us; }
-    int rc = ok ? (int)rep->flipResult : -1;
+    // IN_PROGRESS on a refusal is the previous flip still on its way (submitConfig's late path, or NVKMS's own answer
+    // to a flip over an outstanding one): the caller keeps its frame and presents the next.
+    int rc = ok ? (int)rep->flipResult : rep->flipResult == NV_KMS_FLIP_RESULT_IN_PROGRESS ? (int)NV_KMS_FLIP_RESULT_IN_PROGRESS : -1;
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     if (rcOut) *rcOut = rc;
     const bool accepted = ok && rc == NV_KMS_FLIP_RESULT_SUCCESS;
@@ -3268,7 +3542,6 @@ IOReturn NVRMNVDAFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
     char c[5] = { (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, 0 };
     if (attribute == kIOWindowServerActiveAttribute) {
         FBLOG("setAttribute 'wsrv' %lu -> success", (unsigned long)value);
-        if (value && fLogoKeep) { IODelete(fLogoKeep, uint32_t, (size_t)fLogoW * fLogoH); fLogoKeep = nullptr; }   // WindowServer owns the screen now
         return kIOReturnSuccess; }
     if (attribute == kIOPowerAttribute) {
         FBLOG("setAttribute POWER '%s' -> %lu", c, (unsigned long)value);
