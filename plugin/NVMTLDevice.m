@@ -1980,6 +1980,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 #import "NVMTLForward.m"
 #import "NVMTLLibraryLoad.m"
 #import "NVMTLGL.m"
+#import "NVMTLGLVBlank.m"
 #import "NVMTLEmbedded.m"
 #import "NVMTLVendorCompiler.m"
 #include "nvmtl_vk.c"
